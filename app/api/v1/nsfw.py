@@ -615,8 +615,17 @@ async def _generate_nsfw_inner(data: NSFWRequest) -> Dict[str, Any]:
                 clean_links.append(cu)
 
     lines = ["返回链接:"]
-    for idx, u in enumerate(clean_links, 1):
-        lines.append(f"{idx}. {u}")
+    for idx, u in enumerate(images, 1):
+        lines.append(f"{idx}. (Image) {u}")
+    
+    for idx, item in enumerate(video_results, 1):
+        v_url = _clean_url(item.get("url", ""))
+        p_id = item.get("post_id", "")
+        if v_url:
+            msg = f"{idx}. (Video) {v_url}"
+            if p_id:
+                msg += f" (post_id: {p_id})"
+            lines.append(msg)
 
     response_payload["result"] = "\n".join(lines)
     return response_payload
