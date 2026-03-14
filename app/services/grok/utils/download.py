@@ -222,6 +222,11 @@ class DownloadService:
         logger.info(
             f"Render video started: video_url={video_url}, thumbnail_url={thumbnail_url or '-'}, format={fmt}"
         )
+        if self._is_public_share_url(video_url) and thumbnail_url:
+            logger.info(
+                f"Render video skip thumbnail for public share video: video_url={video_url}, thumbnail_url={thumbnail_url}"
+            )
+            thumbnail_url = ""
         final_video_url = await self.resolve_url(video_url, token, "video")
         final_thumb_url = ""
         if thumbnail_url:

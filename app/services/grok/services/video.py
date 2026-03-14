@@ -136,15 +136,7 @@ def _log_final_video_payload(
 
 
 def _log_raw_video_stream_event(raw_text: str) -> None:
-    text = str(raw_text or "").strip()
-    if not text:
-        return
-    try:
-        payload = orjson.loads(text)
-        pretty = orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode("utf-8")
-    except Exception:
-        pretty = text
-    logger.info(f"Video upstream raw event:\n{pretty}")
+    return
 
 
 def _truncate_video_stream_line(raw_text: str, limit: int = 4000) -> str:
@@ -155,14 +147,7 @@ def _truncate_video_stream_line(raw_text: str, limit: int = 4000) -> str:
 
 
 def _log_video_stream_line(*, stage: str, raw_text: str) -> None:
-    text = str(raw_text or "")
-    if not text:
-        logger.info(f"Video upstream {stage}: <empty>")
-        return
-    logger.info(
-        "Video upstream line "
-        f"({stage}): {_truncate_video_stream_line(text)}"
-    )
+    return
 
 
 def _log_video_stream_end(*, stage: str, reason: str, extra: str = "") -> None:
