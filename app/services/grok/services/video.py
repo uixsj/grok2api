@@ -680,18 +680,31 @@ class VideoService:
     ) -> AsyncGenerator[bytes, None]:
         """Generate video from image."""
         token_tag = _token_tag(token)
+        normalized_image_url = str(image_url or "").strip()
+        if normalized_image_url.startswith("data:"):
+            upload_service = UploadService()
+            try:
+                _, file_uri = await upload_service.upload_file(normalized_image_url, token)
+                normalized_image_url = f"https://assets.grok.com/{file_uri}"
+                logger.info(
+                    "Image to video source uploaded before generation: "
+                    f"token={token_tag}, asset_url={normalized_image_url}"
+                )
+            finally:
+                await upload_service.close()
+
         # 确定逻辑上的 mode
         is_custom = VideoService.is_meaningful_video_prompt(prompt)
         official_mode = "custom" if is_custom else VideoService._map_preset_to_mode(preset)
 
         logger.info(
-            f"Image to video: token={token_tag}, prompt='{prompt[:50]}...', image={image_url[:80]}, mode={official_mode}"
+            f"Image to video: token={token_tag}, prompt='{prompt[:50]}...', image={normalized_image_url[:80]}, mode={official_mode}"
         )
-        post_id = await self.create_image_post(token, image_url)
+        post_id = await self.create_image_post(token, normalized_image_url)
         message = self._build_video_message(
             prompt=prompt,
             preset=preset,
-            source_image_url=image_url,
+            source_image_url=normalized_image_url,
         )
         model_config_override = {
             "modelMap": {
@@ -1070,6 +1083,7 @@ class VideoService:
         stitch_with_extend: bool = True,
         source_image_url: str | None = None,
         reference_items: list[dict[str, Any]] | None = None,
+        single_image_mode: str = "frame",
     ):
         """Video generation entrypoint."""
         # Get token via intelligent routing.
@@ -1190,12 +1204,23 @@ class VideoService:
                     item = reference_items[0]
                     single_parent_post_id = str(item.get("parent_post_id") or "").strip()
                     single_source_image_url = str(item.get("source_image_url") or item.get("image_url") or "").strip()
+                    effective_single_image_mode = str(single_image_mode or "frame").strip().lower() or "frame"
                     if single_parent_post_id:
                         response = await service.generate_from_parent_post(
                             token=token,
                             prompt=prompt,
                             parent_post_id=single_parent_post_id,
                             source_image_url=single_source_image_url,
+                            aspect_ratio=aspect_ratio,
+                            video_length=video_length,
+                            resolution=resolution,
+                            preset=preset,
+                        )
+                    elif effective_single_image_mode == "reference":
+                        response = await service.generate_from_reference_items(
+                            token=token,
+                            prompt=prompt,
+                            reference_items=reference_items,
                             aspect_ratio=aspect_ratio,
                             video_length=video_length,
                             resolution=resolution,
