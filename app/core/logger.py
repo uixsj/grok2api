@@ -79,6 +79,13 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on", "y")
 
 
+def _should_enqueue_logs() -> bool:
+    """Serverless 环境禁用 multiprocessing 队列日志"""
+    if "VERCEL" in os.environ or "AWS_LAMBDA_FUNCTION_NAME" in os.environ:
+        return False
+    return _env_flag("LOG_ENQUEUE", True)
+
+
 def _make_json_sink(output):
     """创建 JSON sink"""
 
@@ -106,6 +113,7 @@ def setup_logging(
     """设置日志配置"""
     logger.remove()
     file_logging = _env_flag("LOG_FILE_ENABLED", file_logging)
+    enqueue_logs = _should_enqueue_logs()
 
     # 控制台输出
     if json_console:
@@ -114,7 +122,7 @@ def setup_logging(
             level=level,
             format="{message}",
             colorize=False,
-            enqueue=True,
+            enqueue=enqueue_logs,
         )
     else:
         logger.add(
@@ -122,7 +130,7 @@ def setup_logging(
             level=level,
             format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{file.name}:{line}</cyan> - <level>{message}</level>",
             colorize=True,
-            enqueue=True,
+            enqueue=enqueue_logs,
         )
 
     # 文件输出
@@ -132,7 +140,7 @@ def setup_logging(
                 _file_json_sink,
                 level=level,
                 format="{message}",
-                enqueue=True,
+                enqueue=enqueue_logs,
             )
         else:
             logger.warning("File logging disabled: no writable log directory.")

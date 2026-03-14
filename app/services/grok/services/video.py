@@ -35,10 +35,10 @@ from app.services.reverse.app_chat import AppChatReverse
 from app.services.reverse.media_post import MediaPostReverse
 from app.services.reverse.video_upscale import VideoUpscaleReverse
 from app.services.reverse.assets_list import AssetsListReverse
+from app.services.grok.utils.upload import UploadService
 
 _VIDEO_SEMAPHORE = None
 _VIDEO_SEM_VALUE = 0
-
 def _get_video_semaphore() -> asyncio.Semaphore:
     """Reverse 接口并发控制（video 服务）。"""
     global _VIDEO_SEMAPHORE, _VIDEO_SEM_VALUE
@@ -97,6 +97,42 @@ async def _canonicalize_parent_media_url(
     if raw_url:
         return raw_url
     return VideoService._build_imagine_public_url(parent_post_id)
+
+
+def _normalize_assets_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    if raw.startswith("/"):
+        return f"https://assets.grok.com{raw}"
+    return f"https://assets.grok.com/{raw}"
+
+def _log_final_video_payload(
+    *,
+    message: str,
+    file_attachments: list[str] | None = None,
+    tool_overrides: dict | None = None,
+    model_config_override: dict | None = None,
+    mode: str | None = None,
+) -> None:
+    payload = {
+        "message": str(message or ""),
+        "fileAttachments": [
+            str(item or "").strip()
+            for item in (file_attachments or [])
+            if str(item or "").strip()
+        ],
+        "toolOverrides": tool_overrides or {},
+        "modelConfigOverride": model_config_override or {},
+        "mode": mode,
+    }
+    try:
+        payload_text = orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode("utf-8")
+    except Exception:
+        payload_text = str(payload)
+    logger.info(f"Video upstream payload before send:\n{payload_text}")
 
 
 def _classify_video_error(exc: Exception) -> tuple[str, str, int]:
@@ -358,6 +394,184 @@ class VideoService:
             token, prompt="", media_type="MEDIA_POST_TYPE_IMAGE", media_url=image_url
         )
 
+    async def _resolve_reference_source_url(
+        self,
+        token: str,
+        item: dict[str, Any],
+    ) -> str:
+        parent_post_id = str(item.get("parent_post_id") or "").strip()
+        image_url = str(item.get("image_url") or "").strip()
+        source_image_url = str(item.get("source_image_url") or "").strip()
+
+        if parent_post_id:
+            return await _canonicalize_parent_media_url(
+                token,
+                parent_post_id,
+                source_image_url or image_url,
+            )
+        return source_image_url or image_url
+
+    async def _upload_reference_items(
+        self,
+        token: str,
+        reference_items: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        uploaded: list[dict[str, str]] = []
+        upload_service = UploadService()
+        try:
+            for index, item in enumerate(reference_items):
+                source_url = await self._resolve_reference_source_url(token, item)
+                if not source_url:
+                    raise ValidationException(f"第 {index + 1} 张参考图缺少可用来源")
+                uploaded_file_id, file_uri = await upload_service.upload_file(
+                    source_url, token
+                )
+                file_id = str(uploaded_file_id or "").strip()
+                asset_url = _normalize_assets_url(file_uri)
+                uploaded.append(
+                    {
+                        "file_id": str(file_id or "").strip(),
+                        "asset_url": asset_url,
+                        "source_url": source_url,
+                        "parent_post_id": str(item.get("parent_post_id") or "").strip(),
+                        "mention_alias": str(item.get("mention_alias") or "").strip(),
+                    }
+                )
+        finally:
+            await upload_service.close()
+        return uploaded
+
+    async def generate_from_reference_items(
+        self,
+        token: str,
+        prompt: str,
+        reference_items: list[dict[str, Any]],
+        aspect_ratio: str = "3:2",
+        video_length: int = 6,
+        resolution: str = "480p",
+        preset: str = "normal",
+    ) -> AsyncGenerator[bytes, None]:
+        token_tag = _token_tag(token)
+        uploaded_refs = await self._upload_reference_items(token, reference_items)
+        if not uploaded_refs:
+            raise ValidationException("至少需要 1 张参考图")
+
+        prompt_text = (prompt or "").strip()
+        alias_map: dict[str, str] = {}
+        ref_tokens: list[str] = []
+        for index, item in enumerate(uploaded_refs, start=1):
+            file_id = str(item.get("file_id") or "").strip()
+            if not file_id:
+                continue
+            token_text = f"@{file_id}"
+            ref_tokens.append(token_text)
+            alias = str(item.get("mention_alias") or "").strip() or f"Image {index}"
+            alias_map[f"@{alias}"] = token_text
+            alias_map[f"@{alias.replace(' ', '')}"] = token_text
+
+        for alias, token_text in alias_map.items():
+            if alias in prompt_text:
+                prompt_text = prompt_text.replace(alias, token_text)
+
+        if ref_tokens:
+            has_mentions = any(token_text in prompt_text for token_text in ref_tokens)
+            if not has_mentions:
+                prompt_text = f"{' '.join(ref_tokens)} {prompt_text}".strip()
+
+        official_mode = "custom" if VideoService.is_meaningful_video_prompt(prompt_text) else "custom"
+        post_id = await self.create_post(token, prompt_text, media_type="MEDIA_POST_TYPE_VIDEO")
+        image_references = [item["asset_url"] for item in uploaded_refs if item.get("asset_url")]
+        file_attachments = [
+            str(item.get("file_id") or "").strip()
+            for item in uploaded_refs
+            if str(item.get("file_id") or "").strip()
+        ]
+        message = f"{prompt_text} --mode=custom".strip()
+        model_config_override = {
+            "modelMap": {
+                "videoGenModelConfig": {
+                    "parentPostId": post_id,
+                    "aspectRatio": aspect_ratio,
+                    "videoLength": video_length,
+                    "resolutionName": resolution,
+                    "isReferenceToVideo": True,
+                    "imageReferences": image_references,
+                }
+            }
+        }
+        moderated_max_retry = max(1, int(get_config("video.moderated_max_retry", 5)))
+
+        logger.info(
+            "Multi-reference video request prepared: "
+            f"token={token_tag}, reference_count={len(uploaded_refs)}, post_id={post_id}, "
+            f"resolution={resolution}, video_length={video_length}, ratio={aspect_ratio}, mode={official_mode}"
+        )
+
+        async def _stream():
+            for attempt in range(1, moderated_max_retry + 1):
+                session = AsyncSession()
+                moderated_hit = False
+                try:
+                    async with _get_video_semaphore():
+                        _log_final_video_payload(
+                            message=message,
+                            file_attachments=file_attachments,
+                            tool_overrides={"videoGen": True},
+                            model_config_override=model_config_override,
+                            mode=official_mode,
+                        )
+                        stream_response = await AppChatReverse.request(
+                            session,
+                            token,
+                            message=message,
+                            model="grok-3",
+                            mode=official_mode,
+                            file_attachments=file_attachments,
+                            tool_overrides={"videoGen": True},
+                            model_config_override=model_config_override,
+                        )
+                        logger.info(
+                            "Multi-reference video generation started: "
+                            f"token={token_tag}, post_id={post_id}, attempt={attempt}/{moderated_max_retry}"
+                        )
+                        async for line in stream_response:
+                            if self._is_moderated_line(line):
+                                moderated_hit = True
+                                logger.warning(
+                                    f"Multi-reference video moderated: token={token_tag}, retry {attempt}/{moderated_max_retry}"
+                                )
+                                break
+                            yield line
+
+                    if not moderated_hit:
+                        return
+                    if attempt < moderated_max_retry:
+                        await asyncio.sleep(1.2)
+                        continue
+                    raise UpstreamException(
+                        "Video blocked by moderation",
+                        status_code=400,
+                        details={"moderated": True, "attempts": moderated_max_retry},
+                    )
+                except Exception as e:
+                    logger.error(f"Multi-reference video generation error: {e}")
+                    if isinstance(e, AppException):
+                        raise
+                    msg, code, status = _classify_video_error(e)
+                    raise AppException(
+                        message=msg,
+                        error_type=ErrorType.SERVER.value if status >= 500 else ErrorType.INVALID_REQUEST.value,
+                        code=code,
+                        status_code=status,
+                    )
+                finally:
+                    try:
+                        await session.close()
+                    except Exception:
+                        pass
+
+        return _stream()
+
     async def generate(
         self,
         token: str,
@@ -397,6 +611,13 @@ class VideoService:
                 moderated_hit = False
                 try:
                     async with _get_video_semaphore():
+                        _log_final_video_payload(
+                            message=message,
+                            file_attachments=[],
+                            tool_overrides={"videoGen": True},
+                            model_config_override=model_config_override,
+                            mode=official_mode,
+                        )
                         stream_response = await AppChatReverse.request(
                             session,
                             token,
@@ -459,18 +680,31 @@ class VideoService:
     ) -> AsyncGenerator[bytes, None]:
         """Generate video from image."""
         token_tag = _token_tag(token)
+        normalized_image_url = str(image_url or "").strip()
+        if normalized_image_url.startswith("data:"):
+            upload_service = UploadService()
+            try:
+                _, file_uri = await upload_service.upload_file(normalized_image_url, token)
+                normalized_image_url = f"https://assets.grok.com/{file_uri}"
+                logger.info(
+                    "Image to video source uploaded before generation: "
+                    f"token={token_tag}, asset_url={normalized_image_url}"
+                )
+            finally:
+                await upload_service.close()
+
         # 确定逻辑上的 mode
         is_custom = VideoService.is_meaningful_video_prompt(prompt)
         official_mode = "custom" if is_custom else VideoService._map_preset_to_mode(preset)
 
         logger.info(
-            f"Image to video: token={token_tag}, prompt='{prompt[:50]}...', image={image_url[:80]}, mode={official_mode}"
+            f"Image to video: token={token_tag}, prompt='{prompt[:50]}...', image={normalized_image_url[:80]}, mode={official_mode}"
         )
-        post_id = await self.create_image_post(token, image_url)
+        post_id = await self.create_image_post(token, normalized_image_url)
         message = self._build_video_message(
             prompt=prompt,
             preset=preset,
-            source_image_url=image_url,
+            source_image_url=normalized_image_url,
         )
         model_config_override = {
             "modelMap": {
@@ -491,6 +725,13 @@ class VideoService:
                 moderated_hit = False
                 try:
                     async with _get_video_semaphore():
+                        _log_final_video_payload(
+                            message=message,
+                            file_attachments=[],
+                            tool_overrides={"videoGen": True},
+                            model_config_override=model_config_override,
+                            mode=official_mode,
+                        )
                         stream_response = await AppChatReverse.request(
                             session,
                             token,
@@ -621,6 +862,13 @@ class VideoService:
                 moderated_hit = False
                 try:
                     async with _get_video_semaphore():
+                        _log_final_video_payload(
+                            message=message,
+                            file_attachments=[],
+                            tool_overrides={"videoGen": True},
+                            model_config_override=model_config_override,
+                            mode=official_mode,
+                        )
                         stream_response = await AppChatReverse.request(
                             session,
                             token,
@@ -756,6 +1004,13 @@ class VideoService:
                 moderated_hit = False
                 try:
                     async with _get_video_semaphore():
+                        _log_final_video_payload(
+                            message=message,
+                            file_attachments=file_attachments,
+                            tool_overrides={"videoGen": True},
+                            model_config_override=model_config_override,
+                            mode=mode,
+                        )
                         stream_response = await AppChatReverse.request(
                             session,
                             token,
@@ -827,6 +1082,8 @@ class VideoService:
         file_attachment_id: str | None = None,
         stitch_with_extend: bool = True,
         source_image_url: str | None = None,
+        reference_items: list[dict[str, Any]] | None = None,
+        single_image_mode: str = "frame",
     ):
         """Video generation entrypoint."""
         # Get token via intelligent routing.
@@ -844,11 +1101,22 @@ class VideoService:
 
         # Extract content.
         from app.services.grok.services.chat import MessageExtractor
-        from app.services.grok.utils.upload import UploadService
 
         prompt, file_attachments, image_attachments = MessageExtractor.extract(messages)
         parent_post_id = (parent_post_id or "").strip() or None
         source_image_url = (source_image_url or "").strip()
+        reference_items = [item for item in (reference_items or []) if isinstance(item, dict)]
+        if image_attachments and not reference_items:
+            reference_items = [
+                {
+                    "parent_post_id": "",
+                    "image_url": str(image_url or "").strip(),
+                    "source_image_url": str(image_url or "").strip(),
+                    "mention_alias": f"Image {index}",
+                }
+                for index, image_url in enumerate(image_attachments, start=1)
+                if str(image_url or "").strip()
+            ]
         used_tokens: set[str] = set()
 
         for attempt in range(max_token_retries):
@@ -881,7 +1149,7 @@ class VideoService:
             try:
                 # Handle image attachments.
                 image_url = None
-                if (not parent_post_id) and image_attachments:
+                if (not parent_post_id) and image_attachments and not reference_items:
                     upload_service = UploadService()
                     try:
                         for attach_data in image_attachments:
@@ -911,6 +1179,16 @@ class VideoService:
                         preset=preset,
                         stitch_with_extend=stitch_with_extend,
                     )
+                elif len(reference_items) > 1:
+                    response = await service.generate_from_reference_items(
+                        token=token,
+                        prompt=prompt,
+                        reference_items=reference_items,
+                        aspect_ratio=aspect_ratio,
+                        video_length=video_length,
+                        resolution=resolution,
+                        preset=preset,
+                    )
                 elif parent_post_id:
                     response = await service.generate_from_parent_post(
                         token=token,
@@ -922,6 +1200,42 @@ class VideoService:
                         resolution=resolution,
                         preset=preset,
                     )
+                elif len(reference_items) == 1:
+                    item = reference_items[0]
+                    single_parent_post_id = str(item.get("parent_post_id") or "").strip()
+                    single_source_image_url = str(item.get("source_image_url") or item.get("image_url") or "").strip()
+                    effective_single_image_mode = str(single_image_mode or "frame").strip().lower() or "frame"
+                    if single_parent_post_id:
+                        response = await service.generate_from_parent_post(
+                            token=token,
+                            prompt=prompt,
+                            parent_post_id=single_parent_post_id,
+                            source_image_url=single_source_image_url,
+                            aspect_ratio=aspect_ratio,
+                            video_length=video_length,
+                            resolution=resolution,
+                            preset=preset,
+                        )
+                    elif effective_single_image_mode == "reference":
+                        response = await service.generate_from_reference_items(
+                            token=token,
+                            prompt=prompt,
+                            reference_items=reference_items,
+                            aspect_ratio=aspect_ratio,
+                            video_length=video_length,
+                            resolution=resolution,
+                            preset=preset,
+                        )
+                    else:
+                        response = await service.generate_from_image(
+                            token,
+                            prompt,
+                            single_source_image_url,
+                            aspect_ratio,
+                            video_length,
+                            resolution,
+                            preset,
+                        )
                 elif image_url:
                     response = await service.generate_from_image(
                         token,

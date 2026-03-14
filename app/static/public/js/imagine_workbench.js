@@ -1,4 +1,4 @@
-﻿(() => {
+(() => {
   const seedImageInput = document.getElementById('seedImageInput');
   const selectSeedBtn = document.getElementById('selectSeedBtn');
   const seedFileName = document.getElementById('seedFileName');
@@ -10,7 +10,9 @@
   const previewEmpty = document.getElementById('previewEmpty');
   const currentParentId = document.getElementById('currentParentId');
   const currentMode = document.getElementById('currentMode');
+  const editPromptRichInput = document.getElementById('editPromptRichInput');
   const editPromptInput = document.getElementById('editPromptInput');
+  const editPromptMentionMenu = document.getElementById('editPromptMentionMenu');
   const submitEditBtn = document.getElementById('submitEditBtn');
   const resetCycleBtn = document.getElementById('resetCycleBtn');
   const clearHistoryBtn = document.getElementById('clearHistoryBtn');
@@ -21,7 +23,7 @@
   const editProgressWrap = document.getElementById('editProgressWrap');
   const editProgressBar = document.getElementById('editProgressBar');
   const editProgressText = document.getElementById('editProgressText');
-  const REFERENCE_LIMIT = 3;
+  const REFERENCE_LIMIT = 5;
 
   const state = {
     editing: false,
@@ -39,6 +41,10 @@
   let editProgressHideTimer = null;
   let editProgressValue = 0;
   let dragCounter = 0;
+  let activePromptMentionIndex = -1;
+  let isSyncingPromptEditor = false;
+  let lastPromptMentionRange = null;
+  let lastPromptMentionContext = null;
 
   function toast(message, type) {
     if (typeof showToast === 'function') {
@@ -401,6 +407,415 @@
     return `ref_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
   }
 
+  function escapeRegExp(value) {
+    return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function getPromptMentionCandidates() {
+    return state.referenceImages.map((item, index) => ({
+      id: item.id,
+      label: String(item.mentionAlias || `Image ${index + 1}`).trim(),
+      token: `@${String(item.mentionAlias || `Image ${index + 1}`).trim()}`,
+      originalId: String(item.originalId || item.parentPostId || '').trim(),
+      imageUrl: String(item.data || '').trim(),
+    }));
+  }
+
+  function updatePromptEditorEmptyState() {
+    if (!editPromptRichInput) return;
+    const hasContent = Array.from(editPromptRichInput.childNodes).some((node) => {
+      if (node.nodeType === Node.TEXT_NODE) return String(node.textContent || '').length > 0;
+      if (node.nodeType === Node.ELEMENT_NODE) return true;
+      return false;
+    });
+    editPromptRichInput.classList.toggle('is-empty', !hasContent);
+  }
+
+  function createMentionChip(candidate) {
+    const chip = document.createElement('span');
+    chip.className = 'prompt-mention-chip react-renderer node-mention inline-flex align-middle';
+    chip.contentEditable = 'false';
+    chip.dataset.mentionToken = candidate.token;
+    chip.dataset.mentionLabel = candidate.label;
+    chip.dataset.originalId = candidate.originalId || '';
+    chip.tabIndex = 0;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'prompt-mention-chip-inner inline-flex items-center';
+    wrapper.dataset.mentionType = 'attachment';
+    wrapper.dataset.nodeViewWrapper = '';
+    wrapper.style.whiteSpace = 'normal';
+
+    if (candidate.imageUrl) {
+      const thumbWrap = document.createElement('div');
+      thumbWrap.className = 'prompt-mention-chip-thumb-wrap';
+
+      const thumb = document.createElement('img');
+      thumb.className = 'prompt-mention-chip-thumb';
+      thumb.src = candidate.imageUrl;
+      thumb.alt = '';
+      thumbWrap.appendChild(thumb);
+      wrapper.appendChild(thumbWrap);
+    }
+
+    const label = document.createElement('span');
+    label.className = 'prompt-mention-chip-label';
+    label.textContent = candidate.token;
+    wrapper.appendChild(label);
+    chip.appendChild(wrapper);
+    return chip;
+  }
+
+  function clearActivePromptChip() {
+    if (!editPromptRichInput) return;
+    editPromptRichInput.querySelectorAll('.prompt-mention-chip.is-active').forEach((node) => {
+      node.classList.remove('is-active');
+    });
+  }
+
+  function getActivePromptChip() {
+    return editPromptRichInput ? editPromptRichInput.querySelector('.prompt-mention-chip.is-active') : null;
+  }
+
+  function getSelectedPromptChip() {
+    if (!editPromptRichInput || !window.getSelection) return null;
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return null;
+    const range = selection.getRangeAt(0);
+    const startNode = range.startContainer;
+    if (startNode && startNode.nodeType === Node.ELEMENT_NODE && startNode.classList && startNode.classList.contains('prompt-mention-chip')) {
+      return startNode;
+    }
+    const parent = startNode && startNode.parentElement ? startNode.parentElement.closest('.prompt-mention-chip') : null;
+    return parent && editPromptRichInput.contains(parent) ? parent : null;
+  }
+
+  function selectPromptChip(chip) {
+    if (!chip || !editPromptRichInput) return;
+    clearActivePromptChip();
+    chip.classList.add('is-active');
+    const selection = window.getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    range.selectNode(chip);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    editPromptRichInput.focus();
+  }
+
+  function getChipAdjacentToSelection(direction = 'backward') {
+    if (!editPromptRichInput || !window.getSelection) return null;
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return null;
+    const range = selection.getRangeAt(0);
+    const startNode = range.startContainer;
+    const offset = range.startOffset;
+
+    if (range.collapsed) {
+      if (startNode.nodeType === Node.TEXT_NODE) {
+        const textLength = String(startNode.textContent || '').length;
+        if (direction === 'backward' && offset !== 0) {
+          return null;
+        }
+        if (direction === 'forward' && offset !== textLength) {
+          return null;
+        }
+        const sibling = direction === 'backward' ? startNode.previousSibling : startNode.nextSibling;
+        if (sibling && sibling.nodeType === Node.ELEMENT_NODE && sibling.classList && sibling.classList.contains('prompt-mention-chip')) {
+          return sibling;
+        }
+      } else if (startNode.nodeType === Node.ELEMENT_NODE) {
+        const neighbour = direction === 'backward' ? startNode.childNodes[offset - 1] : startNode.childNodes[offset];
+        if (neighbour && neighbour.nodeType === Node.TEXT_NODE) {
+          const neighbourText = String(neighbour.textContent || '');
+          if (neighbourText.length > 0) {
+            return null;
+          }
+        }
+        const index = direction === 'backward' ? offset - 1 : offset;
+        const candidate = startNode.childNodes[index];
+        if (candidate && candidate.nodeType === Node.ELEMENT_NODE && candidate.classList && candidate.classList.contains('prompt-mention-chip')) {
+          return candidate;
+        }
+      }
+    } else if (startNode.nodeType === Node.ELEMENT_NODE && startNode.classList && startNode.classList.contains('prompt-mention-chip')) {
+      return startNode;
+    }
+    return null;
+  }
+
+  function hasEditableTextNearSelection(direction = 'backward') {
+    if (!editPromptRichInput || !window.getSelection) return false;
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return false;
+    const range = selection.getRangeAt(0);
+    if (!range.collapsed) return false;
+    const startNode = range.startContainer;
+    const offset = range.startOffset;
+
+    if (startNode.nodeType === Node.TEXT_NODE) {
+      const text = String(startNode.textContent || '');
+      return direction === 'backward' ? offset > 0 : offset < text.length;
+    }
+
+    if (startNode.nodeType === Node.ELEMENT_NODE) {
+      const neighbour = direction === 'backward' ? startNode.childNodes[offset - 1] : startNode.childNodes[offset];
+      if (!neighbour) return false;
+      if (neighbour.nodeType === Node.TEXT_NODE) {
+        return String(neighbour.textContent || '').length > 0;
+      }
+      return false;
+    }
+
+    return false;
+  }
+
+  function serializePromptRichInput() {
+    if (!editPromptRichInput) return '';
+    const parts = [];
+    editPromptRichInput.childNodes.forEach((node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        parts.push(node.textContent || '');
+        return;
+      }
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node;
+        if (el.classList && el.classList.contains('prompt-mention-chip')) {
+          parts.push(el.dataset.mentionToken || el.textContent || '');
+        } else {
+          parts.push(el.textContent || '');
+        }
+      }
+    });
+    return parts.join('');
+  }
+
+  function setPromptTextareaValue(value) {
+    if (!editPromptInput) return;
+    if (editPromptInput.value === value) return;
+    isSyncingPromptEditor = true;
+    editPromptInput.value = value;
+    editPromptInput.dispatchEvent(new Event('input', { bubbles: true }));
+    isSyncingPromptEditor = false;
+  }
+
+  function getPromptValue() {
+    return String(editPromptInput ? editPromptInput.value : '').trim();
+  }
+
+  function setCaretAfterNode(node) {
+    if (!editPromptRichInput || !node) return;
+    const range = document.createRange();
+    range.setStartAfter(node);
+    range.collapse(true);
+    const selection = window.getSelection();
+    if (!selection) return;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    editPromptRichInput.focus();
+  }
+
+  function hidePromptMentionMenu() {
+    activePromptMentionIndex = -1;
+    if (!editPromptMentionMenu) return;
+    editPromptMentionMenu.classList.add('hidden');
+    editPromptMentionMenu.innerHTML = '';
+    lastPromptMentionContext = null;
+  }
+
+  function resolvePromptMentionContext(range) {
+    if (!editPromptRichInput || !range) return null;
+    if (!editPromptRichInput.contains(range.startContainer)) return null;
+    if (range.startContainer.nodeType !== Node.TEXT_NODE) {
+      return null;
+    }
+    const textNode = range.startContainer;
+    const before = String(textNode.textContent || '').slice(0, range.startOffset);
+    const match = before.match(/@([^\s@]*)$/);
+    if (!match) return null;
+    return {
+      textNode,
+      startOffset: before.length - match[1].length - 1,
+      endOffset: range.startOffset,
+      query: match[1] || '',
+    };
+  }
+
+  function getPromptMentionContext() {
+    if (!editPromptRichInput) return null;
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return null;
+    const range = selection.getRangeAt(0);
+    return resolvePromptMentionContext(range);
+  }
+
+  function insertPromptMentionChip(candidate) {
+    if (!editPromptRichInput) return;
+    const selection = window.getSelection();
+    let range = null;
+    if (selection && selection.rangeCount) {
+      const currentRange = selection.getRangeAt(0);
+      if (editPromptRichInput.contains(currentRange.startContainer)) {
+        range = currentRange.cloneRange();
+      }
+    }
+    if (!range && lastPromptMentionRange) {
+      range = lastPromptMentionRange.cloneRange();
+    }
+    const context = resolvePromptMentionContext(range) || lastPromptMentionContext;
+
+    if (!context) {
+      const chip = createMentionChip(candidate);
+      editPromptRichInput.appendChild(chip);
+      editPromptRichInput.appendChild(document.createTextNode(' '));
+      normalizePromptRichInputTokens(true);
+      hidePromptMentionMenu();
+      return;
+    }
+
+    if (context.textNode) {
+      const raw = String(context.textNode.textContent || '');
+      context.textNode.textContent = `${raw.slice(0, context.startOffset)}${raw.slice(context.endOffset)}`;
+      const workingRange = document.createRange();
+      workingRange.setStart(context.textNode, context.startOffset);
+      workingRange.collapse(true);
+      if (selection) {
+        selection.removeAllRanges();
+        selection.addRange(workingRange);
+      }
+      range = workingRange;
+    }
+
+    const chip = createMentionChip(candidate);
+    range.insertNode(chip);
+    const trailingSpace = document.createTextNode(' ');
+    chip.after(trailingSpace);
+    setCaretAfterNode(trailingSpace);
+    syncPromptTextareaFromRichInput();
+    hidePromptMentionMenu();
+  }
+
+  function renderPromptMentionMenu() {
+    if (!editPromptMentionMenu || !editPromptRichInput) return;
+    const context = getPromptMentionContext();
+    if (!context) {
+      hidePromptMentionMenu();
+      return;
+    }
+    const query = String(context.query || '').trim().toLowerCase();
+    lastPromptMentionContext = context;
+    lastPromptMentionRange = window.getSelection() && window.getSelection().rangeCount
+      ? window.getSelection().getRangeAt(0).cloneRange()
+      : lastPromptMentionRange;
+    const candidates = getPromptMentionCandidates().filter((item) => {
+      return !query || item.label.toLowerCase().includes(query) || item.token.toLowerCase().includes(query);
+    });
+    if (!candidates.length) {
+      hidePromptMentionMenu();
+      return;
+    }
+    if (activePromptMentionIndex < 0 || activePromptMentionIndex >= candidates.length) {
+      activePromptMentionIndex = 0;
+    }
+    editPromptMentionMenu.innerHTML = '';
+    candidates.forEach((candidate, index) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'prompt-mention-item';
+      if (index === activePromptMentionIndex) {
+        button.classList.add('is-active');
+      }
+      button.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+        insertPromptMentionChip(candidate);
+      });
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        insertPromptMentionChip(candidate);
+      });
+
+      if (candidate.imageUrl) {
+        const thumb = document.createElement('img');
+        thumb.className = 'prompt-mention-thumb';
+        thumb.src = candidate.imageUrl;
+        thumb.alt = candidate.label;
+        button.appendChild(thumb);
+      }
+
+      const label = document.createElement('span');
+      label.className = 'prompt-mention-label';
+      label.textContent = candidate.label;
+      button.appendChild(label);
+      editPromptMentionMenu.appendChild(button);
+    });
+    editPromptMentionMenu.classList.remove('hidden');
+  }
+
+  function syncPromptTextareaFromRichInput() {
+    if (!editPromptRichInput) return;
+    const value = serializePromptRichInput();
+    setPromptTextareaValue(value);
+    clearActivePromptChip();
+    updatePromptEditorEmptyState();
+  }
+
+  function normalizePromptRichInputTokens(moveCaretToEnd = true) {
+    if (!editPromptRichInput) return;
+    const raw = serializePromptRichInput();
+    rebuildPromptRichInputFromText(raw);
+    if (moveCaretToEnd) {
+      const selection = window.getSelection();
+      if (selection) {
+        const range = document.createRange();
+        range.selectNodeContents(editPromptRichInput);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+    }
+    syncPromptTextareaFromRichInput();
+  }
+
+  function rebuildPromptRichInputFromText(value) {
+    if (!editPromptRichInput) return;
+    const raw = String(value || '');
+    const candidates = getPromptMentionCandidates();
+    const tokenMap = new Map();
+    candidates.forEach((item) => {
+      tokenMap.set(item.token, item);
+      if (item.originalId) {
+        tokenMap.set(`@${item.originalId}`, item);
+      }
+    });
+
+    editPromptRichInput.innerHTML = '';
+    const tokenPattern = /@Image\s+\d+|@[0-9a-fA-F-]{32,36}/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = tokenPattern.exec(raw)) !== null) {
+      const [token] = match;
+      if (match.index > lastIndex) {
+        editPromptRichInput.appendChild(document.createTextNode(raw.slice(lastIndex, match.index)));
+      }
+      const candidate = tokenMap.get(token);
+      if (candidate) {
+        editPromptRichInput.appendChild(createMentionChip(candidate));
+      } else {
+        editPromptRichInput.appendChild(document.createTextNode(token));
+      }
+      lastIndex = match.index + token.length;
+    }
+    if (lastIndex < raw.length) {
+      editPromptRichInput.appendChild(document.createTextNode(raw.slice(lastIndex)));
+    }
+    updatePromptEditorEmptyState();
+  }
+
+  function syncPromptRichInputFromTextarea() {
+    if (!editPromptInput || !editPromptRichInput || isSyncingPromptEditor) return;
+    rebuildPromptRichInputFromText(editPromptInput.value || '');
+  }
+
   function getPrimaryReference() {
     if (!state.referenceImages.length) return null;
     return state.referenceImages[0];
@@ -411,6 +826,16 @@
     state.referenceImages.sort((a, b) => {
       return a.createdAt - b.createdAt;
     });
+    state.referenceImages.forEach((item, index) => {
+      item.mentionAlias = `Image ${index + 1}`;
+      if (!item.originalId) {
+        const originalId = String(item.parentPostId || extractParentPostId(item.sourceImageUrl || item.data || '') || '').trim();
+        if (originalId) {
+          item.originalId = originalId;
+        }
+      }
+    });
+    syncPromptRichInputFromTextarea();
   }
 
   function updateReferenceSummary() {
@@ -424,7 +849,7 @@
     if (!state.referenceImages.length) {
       const empty = document.createElement('div');
       empty.className = 'reference-empty';
-      empty.textContent = '可上传 / 粘贴 / 拖拽参考图（最多 3 张）';
+      empty.textContent = `可上传 / 粘贴 / 拖拽参考图（最多 ${REFERENCE_LIMIT} 张）`;
       referenceStrip.appendChild(empty);
       updateReferenceSummary();
       return;
@@ -444,6 +869,11 @@
       img.alt = item.name || 'reference';
       img.loading = 'lazy';
       card.appendChild(img);
+
+      const badge = document.createElement('span');
+      badge.className = 'reference-index-badge';
+      badge.textContent = item.mentionAlias || 'Image';
+      card.appendChild(badge);
 
       const removeBtn = document.createElement('button');
       removeBtn.type = 'button';
@@ -684,6 +1114,10 @@
     if (resetCycleBtn) resetCycleBtn.disabled = state.editing;
     if (clearHistoryBtn) clearHistoryBtn.disabled = state.editing;
     if (editPromptInput) editPromptInput.disabled = state.editing;
+    if (editPromptRichInput) {
+      editPromptRichInput.contentEditable = state.editing ? 'false' : 'true';
+      editPromptRichInput.classList.toggle('is-disabled', state.editing);
+    }
 
     if (state.editing) {
       setStatus('running', '编辑中...');
@@ -955,7 +1389,7 @@
       return;
     }
 
-    const prompt = String(editPromptInput ? editPromptInput.value : '').trim();
+    const prompt = getPromptValue();
     if (!prompt) {
       toast('请输入编辑提示词', 'warning');
       return;
@@ -985,8 +1419,25 @@
       .slice(0, REFERENCE_LIMIT)
       .map((item) => String(item.data || '').trim())
       .filter(Boolean);
+    const referenceItems = state.referenceImages
+      .slice(0, REFERENCE_LIMIT)
+      .map((item, index) => {
+        const imageUrl = String(item.data || '').trim();
+        const sourceImageUrl = String(item.sourceImageUrl || imageUrl || '').trim();
+        const parentPostId = String(item.parentPostId || '').trim();
+        const originalId = String(item.originalId || parentPostId || extractParentPostId(sourceImageUrl || imageUrl) || '').trim();
+        return {
+          image_url: imageUrl,
+          source_image_url: sourceImageUrl,
+          parent_post_id: parentPostId,
+          original_id: originalId,
+          mention_alias: item.mentionAlias || `Image ${index + 1}`,
+        };
+      })
+      .filter((item) => item.image_url || item.source_image_url || item.parent_post_id);
     if (references.length) {
       body.image_references = references;
+      body.reference_items = referenceItems;
       const firstRef = references[0];
       if (firstRef.startsWith('data:image/')) {
         body.image_base64 = firstRef;
@@ -999,6 +1450,15 @@
       body.parent_post_id = state.currentParentPostId;
       if (state.currentSourceImageUrl) {
         body.source_image_url = state.currentSourceImageUrl;
+      }
+      if (!body.reference_items || !body.reference_items.length) {
+        body.reference_items = [{
+          image_url: String(state.currentSourceImageUrl || '').trim(),
+          source_image_url: String(state.currentSourceImageUrl || '').trim(),
+          parent_post_id: state.currentParentPostId,
+          original_id: state.currentParentPostId,
+          mention_alias: 'Image 1',
+        }];
       }
     } else if (!references.length) {
       toast('请先添加参考图', 'warning');
@@ -1168,7 +1628,121 @@
       });
     }
 
+    if (editPromptRichInput) {
+      editPromptRichInput.addEventListener('mousedown', (event) => {
+        const chip = event.target instanceof Element ? event.target.closest('.prompt-mention-chip') : null;
+        if (!chip) return;
+        event.preventDefault();
+        selectPromptChip(chip);
+        hidePromptMentionMenu();
+      });
+      editPromptRichInput.addEventListener('beforeinput', (event) => {
+        if (event.inputType !== 'deleteContentBackward' && event.inputType !== 'deleteContentForward') return;
+        const selectedChip = getSelectedPromptChip();
+        if (selectedChip) {
+          event.preventDefault();
+          selectedChip.remove();
+          syncPromptTextareaFromRichInput();
+          return;
+        }
+        const direction = event.inputType === 'deleteContentBackward' ? 'backward' : 'forward';
+        if (hasEditableTextNearSelection(direction)) {
+          return;
+        }
+        const adjacentChip = getChipAdjacentToSelection(direction);
+        if (adjacentChip) {
+          event.preventDefault();
+          adjacentChip.remove();
+          syncPromptTextareaFromRichInput();
+        }
+      });
+      editPromptRichInput.addEventListener('input', () => {
+        syncPromptTextareaFromRichInput();
+        renderPromptMentionMenu();
+      });
+      editPromptRichInput.addEventListener('click', (event) => {
+        const chip = event.target instanceof Element ? event.target.closest('.prompt-mention-chip') : null;
+        if (chip) {
+          selectPromptChip(chip);
+          hidePromptMentionMenu();
+          return;
+        }
+        clearActivePromptChip();
+        renderPromptMentionMenu();
+      });
+      editPromptRichInput.addEventListener('blur', () => {
+        normalizePromptRichInputTokens(false);
+        window.setTimeout(() => hidePromptMentionMenu(), 120);
+      });
+      editPromptRichInput.addEventListener('keydown', (event) => {
+        const menuOpen = editPromptMentionMenu && !editPromptMentionMenu.classList.contains('hidden');
+        if (menuOpen && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+          event.preventDefault();
+          const total = editPromptMentionMenu.querySelectorAll('.prompt-mention-item').length;
+          if (total > 0) {
+            activePromptMentionIndex = event.key === 'ArrowDown'
+              ? (activePromptMentionIndex + 1 + total) % total
+              : (activePromptMentionIndex - 1 + total) % total;
+            renderPromptMentionMenu();
+          }
+          return;
+        }
+        if (menuOpen && event.key === 'Enter') {
+          const active = editPromptMentionMenu.querySelector('.prompt-mention-item.is-active .prompt-mention-label');
+          if (active) {
+            event.preventDefault();
+            const candidate = getPromptMentionCandidates().find((item) => item.label === active.textContent);
+            if (candidate) insertPromptMentionChip(candidate);
+            return;
+          }
+        }
+        if (menuOpen && event.key === 'Escape') {
+          event.preventDefault();
+          hidePromptMentionMenu();
+          return;
+        }
+        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+          event.preventDefault();
+          runEdit();
+          return;
+        }
+        if (event.key === 'Backspace' || event.key === 'Delete') {
+          const selectedChip = getSelectedPromptChip();
+          if (selectedChip) {
+            event.preventDefault();
+            selectedChip.remove();
+            syncPromptTextareaFromRichInput();
+            return;
+          }
+        }
+        if (event.key === 'Backspace' && hasEditableTextNearSelection('backward')) {
+          return;
+        }
+        if (event.key === 'Delete' && hasEditableTextNearSelection('forward')) {
+          return;
+        }
+        if ((event.key === 'Backspace' || event.key === 'Delete') && window.getSelection) {
+          const selection = window.getSelection();
+          if (selection && selection.rangeCount) {
+            const range = selection.getRangeAt(0);
+            const node = event.key === 'Backspace'
+              ? (range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.previousSibling : range.startContainer.childNodes[range.startOffset - 1])
+              : (range.startContainer.nodeType === Node.TEXT_NODE ? range.startContainer.nextSibling : range.startContainer.childNodes[range.startOffset]);
+            if (node && node.nodeType === Node.ELEMENT_NODE && node.classList && node.classList.contains('prompt-mention-chip')) {
+              event.preventDefault();
+              node.remove();
+              syncPromptTextareaFromRichInput();
+              return;
+            }
+          }
+        }
+      });
+    }
+
     if (editPromptInput) {
+      editPromptInput.addEventListener('input', () => {
+        syncPromptRichInputFromTextarea();
+      });
       editPromptInput.addEventListener('keydown', (event) => {
         if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
           event.preventDefault();
@@ -1209,7 +1783,7 @@
       const text = dataTransfer ? String(dataTransfer.getData('text') || '').trim() : '';
       if (!text) return;
       const target = event.target;
-      const isTypingInPrompt = target === editPromptInput;
+      const isTypingInPrompt = target === editPromptInput || target === editPromptRichInput || (editPromptRichInput && editPromptRichInput.contains(target));
       const isTypingInParentInput = target === parentPostInput;
       if (isTypingInPrompt) return;
       if (!isTypingInParentInput && (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
@@ -1219,6 +1793,19 @@
       if (ok) {
         event.preventDefault();
       }
+    });
+
+    document.addEventListener('click', (event) => {
+      if (!editPromptMentionMenu || editPromptMentionMenu.classList.contains('hidden')) return;
+      if (editPromptMentionMenu.contains(event.target)) return;
+      if (editPromptRichInput && editPromptRichInput.contains(event.target)) return;
+      hidePromptMentionMenu();
+    });
+
+    document.addEventListener('click', (event) => {
+      if (!editPromptRichInput) return;
+      if (editPromptRichInput.contains(event.target)) return;
+      clearActivePromptChip();
     });
 
     if (previewShell) {
@@ -1283,34 +1870,55 @@
     });
   }
 
-  function mountInlineSubmitButton() {
-    if (!editPromptInput || !submitEditBtn) return false;
-    const promptWrap = editPromptInput.closest('.prompt-enhance-wrap');
-    if (!promptWrap) return false;
-    if (!promptWrap.contains(submitEditBtn)) {
-      const actionRow = submitEditBtn.parentElement;
-      promptWrap.appendChild(submitEditBtn);
-      if (actionRow && actionRow.classList && actionRow.classList.contains('action-row')) {
-        actionRow.classList.add('action-row-inline');
-      }
-    }
-    submitEditBtn.classList.add('inline-submit-btn');
-    return true;
-  }
+  // ─── 移动端底部 Sticky 操作栏事件绑定 ────────────────────────────────────
+  function initStickyBar() {
+    const wbBar        = document.getElementById('wbStickyBar');
+    if (!wbBar) return;
 
-  function ensureInlineSubmitButton(attempt = 0) {
-    if (mountInlineSubmitButton()) return;
-    if (attempt >= 20) return;
-    setTimeout(() => ensureInlineSubmitButton(attempt + 1), 50);
+    const wbSubmit     = document.getElementById('wbSubmitBtn');
+    const wbAddRef     = document.getElementById('wbAddRefBtn');
+    const wbUseId      = document.getElementById('wbUseIdBtn');
+    const wbReset      = document.getElementById('wbResetBtn');
+    const wbClearHist  = document.getElementById('wbClearHistoryBtn');
+
+    // 图标按钮代理原始按钮 click
+    if (wbAddRef && selectSeedBtn) {
+      wbAddRef.addEventListener('click', () => selectSeedBtn.click());
+    }
+    if (wbUseId && applyParentBtn) {
+      wbUseId.addEventListener('click', () => applyParentBtn.click());
+    }
+    if (wbReset && resetCycleBtn) {
+      wbReset.addEventListener('click', () => resetCycleBtn.click());
+    }
+    if (wbClearHist && clearHistoryBtn) {
+      wbClearHist.addEventListener('click', () => clearHistoryBtn.click());
+    }
+
+    // 执行编辑：代理 + 同步 disabled 状态
+    if (wbSubmit && submitEditBtn) {
+      wbSubmit.addEventListener('click', () => {
+        if (!submitEditBtn.disabled) submitEditBtn.click();
+      });
+
+      // 初始化状态
+      wbSubmit.disabled = submitEditBtn.disabled;
+
+      // 实时同步 disabled
+      new MutationObserver(() => {
+        wbSubmit.disabled = submitEditBtn.disabled;
+      }).observe(submitEditBtn, { attributes: true, attributeFilter: ['disabled'] });
+    }
   }
 
   function init() {
-    ensureInlineSubmitButton();
     bindEvents();
+    syncPromptRichInputFromTextarea();
     renderReferenceStrip();
     renderHistory();
     resetCycle(false);
     updateMeta();
+    initStickyBar(); // 初始化移动端 Sticky Bar
   }
 
   init();

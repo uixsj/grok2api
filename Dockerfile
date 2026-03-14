@@ -29,7 +29,7 @@ COPY scripts ./scripts
 RUN chmod 755 ./scripts/*.sh
 
 RUN mkdir -p /app/data /app/data/tmp /app/logs \
-    && chmod +x /app/scripts/entrypoint.sh
+    && chmod +x /app/scripts/entrypoint.sh /app/scripts/init_storage.sh
 
 EXPOSE 8000
 

@@ -1,4 +1,4 @@
-﻿(() => {
+(() => {
   const imagePromptInput = document.getElementById('imagePromptInput');
   const videoPromptInput = document.getElementById('videoPromptInput');
   const ratioSelect = document.getElementById('ratioSelect');
@@ -1818,4 +1818,174 @@
   updateCounters();
   updateImageButtons();
   updateVideoButtons();
+
+  /**
+   * NSFW 工作台 双行 Sticky Bar 初始化（移动端专属）
+   */
+  function initNsfwStickyBar() {
+    /* 仅移动端执行，PC 下退出避免干扰 */
+    if (!window.matchMedia('(max-width: 900px)').matches) return;
+
+    /* --- 代理映射（只代理两个垃圾桶，imNextBatchBtn 已移除） --- */
+    const proxyMap = {
+      imClearImagesBtn: 'clearImagesBtn',
+      imClearVideosBtn: 'clearVideosBtn',
+    };
+    Object.entries(proxyMap).forEach(([sId, oId]) => {
+      const sEl = document.getElementById(sId);
+      const oEl = document.getElementById(oId);
+      if (sEl && oEl) sEl.addEventListener('click', () => oEl.click());
+    });
+
+    /* --- 候选图主按钮：生成6张 / 再来6张 / 停止候选 --- */
+    const imGenBtn = document.getElementById('imGenerateBtn');
+    const genPlayIcon = imGenBtn && imGenBtn.querySelector('.nsfw-btn-play');
+    const genStopIcon = imGenBtn && imGenBtn.querySelector('.nsfw-btn-stop');
+    const genLabel = imGenBtn && imGenBtn.querySelector('.nsfw-btn-label');
+
+    function syncGenBtn() {
+      if (!imGenBtn) return;
+      const isRunning = generateBatchBtn && generateBatchBtn.dataset.running === '1';
+      /* 判断是否已经有候选图：imageCount 不为 "0 张" */
+      const hasImages = imageCount && String(imageCount.textContent || '').trim() !== '0 张';
+      imGenBtn.classList.toggle('is-stop', isRunning);
+      if (genPlayIcon) genPlayIcon.style.display = isRunning ? 'none' : '';
+      if (genStopIcon) genStopIcon.style.display = isRunning ? '' : 'none';
+      if (genLabel) {
+        if (isRunning) {
+          genLabel.textContent = '停止候选';
+        } else if (hasImages) {
+          genLabel.textContent = '再来 6 张';
+        } else {
+          genLabel.textContent = '生成 6 张';
+        }
+      }
+    }
+
+    if (imGenBtn) {
+      imGenBtn.addEventListener('click', () => {
+        const isRunning = generateBatchBtn && generateBatchBtn.dataset.running === '1';
+        if (isRunning) {
+          stopBatchBtn && stopBatchBtn.click();
+        } else {
+          /* 再来一批 或 生成 6 张，都走 nextBatchBtn（已有图时） / generateBatchBtn（无图时） */
+          const hasImages = imageCount && String(imageCount.textContent || '').trim() !== '0 张';
+          (hasImages ? nextBatchBtn : generateBatchBtn) && (hasImages ? nextBatchBtn : generateBatchBtn).click();
+        }
+      });
+    }
+
+    if (generateBatchBtn) {
+      new MutationObserver(syncGenBtn).observe(generateBatchBtn, { attributes: true, attributeFilter: ['data-running', 'disabled'] });
+    }
+    /* 同时观察 imageCount 变化以切换按钮文字 */
+    if (imageCount) {
+      new MutationObserver(syncGenBtn).observe(imageCount, { characterData: true, childList: true, subtree: true });
+    }
+    syncGenBtn();
+
+    /* --- 视频主按钮：生成视频/中断视频 --- */
+    const imVideoBtn = document.getElementById('imStartVideoBtn');
+    const vidPlayIcon = imVideoBtn && imVideoBtn.querySelector('.nsfw-btn-play');
+    const vidStopIcon = imVideoBtn && imVideoBtn.querySelector('.nsfw-btn-stop');
+    const vidLabel = imVideoBtn && imVideoBtn.querySelector('.nsfw-btn-label');
+
+    function syncVideoBtn() {
+      if (!imVideoBtn) return;
+      const isRunning = startVideoBtn && startVideoBtn.dataset.running === '1';
+      const hasSelected = startVideoBtn && !startVideoBtn.disabled;
+      imVideoBtn.classList.toggle('is-stop', isRunning);
+      imVideoBtn.disabled = !isRunning && !hasSelected;
+      if (vidPlayIcon) vidPlayIcon.style.display = isRunning ? 'none' : '';
+      if (vidStopIcon) vidStopIcon.style.display = isRunning ? '' : 'none';
+      if (vidLabel) vidLabel.textContent = isRunning ? '中断视频' : '生成视频';
+    }
+
+    if (imVideoBtn) {
+      imVideoBtn.addEventListener('click', () => {
+        const isRunning = startVideoBtn && startVideoBtn.dataset.running === '1';
+        (isRunning ? stopVideoBtn : startVideoBtn) && (isRunning ? stopVideoBtn : startVideoBtn).click();
+      });
+    }
+    if (startVideoBtn) {
+      new MutationObserver(syncVideoBtn).observe(startVideoBtn, { attributes: true, attributeFilter: ['data-running', 'disabled'] });
+    }
+    syncVideoBtn();
+
+    /* --- 候选图已选状态同步 → 第二行文字高亮（垃圾桶始终可点） --- */
+    const videoRow = document.getElementById('nsfwVideoRow');
+    const selectedLabel = document.getElementById('nsfwSelectedLabel');
+
+    function syncSelected() {
+      if (!selectedMeta || !videoRow || !selectedLabel) return;
+      const text = String(selectedMeta.textContent || '').trim();
+      const hasSelected = !text.includes('未选择');
+      videoRow.classList.toggle('has-selected', hasSelected);
+      if (hasSelected) {
+        selectedLabel.textContent = text.length > 22 ? text.slice(0, 22) + '…' : text;
+      } else {
+        selectedLabel.textContent = '未选择候选图';
+      }
+      syncVideoBtn();
+    }
+
+    if (selectedMeta) {
+      new MutationObserver(syncSelected).observe(selectedMeta, { characterData: true, childList: true, subtree: true });
+      syncSelected();
+    }
+
+    /* --- 设置 Bottom Sheet --- */
+    const settingsBtn = document.getElementById('nsfwSettingsBtn');
+    const settingsOverlay = document.getElementById('nsfwSettingsOverlay');
+
+    let settingsSheet = document.getElementById('nsfwSettingsSheet');
+    if (!settingsSheet) {
+      settingsSheet = document.createElement('div');
+      settingsSheet.id = 'nsfwSettingsSheet';
+      settingsSheet.className = 'nsfw-settings-sheet';
+
+      const handle = document.createElement('div');
+      handle.className = 'nsfw-settings-sheet-handle';
+      settingsSheet.appendChild(handle);
+
+      const titleEl = document.createElement('div');
+      titleEl.className = 'nsfw-settings-sheet-title';
+      titleEl.textContent = '生成参数';
+      settingsSheet.appendChild(titleEl);
+
+      /* 将非 textarea 的参数 field 移入 sheet */
+      const formGrid = document.querySelector('.form-grid');
+      if (formGrid) {
+        const nonWideFields = formGrid.querySelectorAll('.field:not(.field-wide)');
+        const sheetGrid = document.createElement('div');
+        sheetGrid.className = 'form-grid';
+        sheetGrid.style.cssText = 'grid-template-columns: 1fr 1fr; gap: 10px 14px;';
+        nonWideFields.forEach(f => sheetGrid.appendChild(f));
+        settingsSheet.appendChild(sheetGrid);
+      }
+
+      document.body.appendChild(settingsSheet);
+    }
+
+    const openSettings = () => {
+      if (!settingsSheet || !settingsOverlay) return;
+      settingsOverlay.classList.add('active');
+      requestAnimationFrame(() => settingsSheet.classList.add('open'));
+    };
+    const closeSettings = () => {
+      if (!settingsSheet || !settingsOverlay) return;
+      settingsSheet.classList.remove('open');
+      settingsOverlay.classList.remove('active');
+    };
+
+    if (settingsBtn) settingsBtn.addEventListener('click', openSettings);
+    if (settingsOverlay) settingsOverlay.addEventListener('click', closeSettings);
+    const sheetHandle = settingsSheet && settingsSheet.querySelector('.nsfw-settings-sheet-handle');
+    if (sheetHandle) sheetHandle.addEventListener('click', closeSettings);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && settingsSheet && settingsSheet.classList.contains('open')) closeSettings();
+    });
+  }
+
+  initNsfwStickyBar();
 })();

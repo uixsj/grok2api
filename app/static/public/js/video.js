@@ -24,6 +24,8 @@
   const spliceBtn = document.getElementById('spliceBtn');
 
   const promptInput = document.getElementById('promptInput');
+  const promptRichInput = document.getElementById('promptRichInput');
+  const referenceMentionMenu = document.getElementById('referenceMentionMenu');
   const imageUrlInput = document.getElementById('imageUrlInput');
   const parentPostInput = document.getElementById('parentPostInput');
   const applyParentBtn = document.getElementById('applyParentBtn');
@@ -36,6 +38,7 @@
   const resolutionSelect = document.getElementById('resolutionSelect');
   const presetSelect = document.getElementById('presetSelect');
   const concurrentSelect = document.getElementById('concurrentSelect');
+  const singleImageModeSelect = document.getElementById('singleImageModeSelect');
   const statusText = document.getElementById('statusText');
   const progressBar = document.getElementById('progressBar');
   const progressFill = document.getElementById('progressFill');
@@ -49,9 +52,15 @@
   const videoEmpty = document.getElementById('videoEmpty');
   const videoStage = document.getElementById('videoStage');
   const referencePreview = document.getElementById('referencePreview');
-  const referencePreviewImg = document.getElementById('referencePreviewImg');
-  const referencePreviewMeta = document.getElementById('referencePreviewMeta');
+  const referenceStrip = document.getElementById('referenceStrip');
+  const currentGallery = document.getElementById('currentGallery');
+  const previewEmpty = document.getElementById('previewEmpty');
+  const currentParentId = document.getElementById('currentParentId');
+  const currentMode = document.getElementById('currentMode');
   const refDropZone = document.getElementById('refDropZone');
+  const referenceLightbox = document.getElementById('referenceLightbox');
+  const referenceLightboxImg = document.getElementById('referenceLightboxImg');
+  const closeReferenceLightboxBtn = document.getElementById('closeReferenceLightboxBtn');
   const historyCount = document.getElementById('historyCount');
   const editPreviewWrap = editVideo ? editVideo.closest('.edit-preview-wrap') : null;
 
@@ -60,7 +69,41 @@
   let isRunning = false;
   let hasRunError = false;
   let startAt = 0;
-  let fileDataUrl = '';
+  const REFERENCE_LIMIT = 7;
+  let referenceImages = [];
+  let currentModeValue = 'upload';
+  let selectedReferenceId = '';
+  let activeMentionIndex = -1;
+  let isSyncingPromptEditor = false;
+  let lastMentionRange = null;
+  let lastMentionContext = null;
+
+  function getReferenceMentionLabel(index) {
+    return `Image ${index + 1}`;
+  }
+
+  function enrichReferenceItem(item, index) {
+    const normalized = {
+      id: item.id || makeReferenceId('ref'),
+      previewUrl: String(item.previewUrl || item.url || item.sourceUrl || '').trim(),
+      sourceUrl: String(item.sourceUrl || item.url || item.previewUrl || '').trim(),
+      url: String(item.url || item.previewUrl || item.sourceUrl || '').trim(),
+      parentPostId: String(item.parentPostId || '').trim(),
+      name: String(item.name || '').trim(),
+      mentionLabel: String(item.mentionLabel || '').trim()
+    };
+    if (!normalized.mentionLabel) {
+      normalized.mentionLabel = getReferenceMentionLabel(index);
+    }
+    return normalized;
+  }
+
+  function refreshReferenceMentionLabels() {
+    referenceImages = referenceImages.map((item, index) => ({
+      ...item,
+      mentionLabel: getReferenceMentionLabel(index)
+    }));
+  }
   let elapsedTimer = null;
   let lastProgress = 0;
   let previewCount = 0;
@@ -382,6 +425,567 @@
     return { url: finalUrl, sourceUrl: sourceUrl || finalUrl, parentPostId };
   }
 
+  function makeReferenceId(prefix = 'ref') {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function updateReferenceSummary() {
+    if (!imageFileName) return;
+    imageFileName.textContent = `已添加 ${referenceImages.length}/${REFERENCE_LIMIT} 张`;
+  }
+
+  function updateReferenceMeta() {
+    const primary = referenceImages[0] || null;
+    if (currentParentId) {
+      currentParentId.textContent = primary && primary.parentPostId ? primary.parentPostId : '-';
+    }
+    if (currentMode) {
+      currentMode.textContent = currentModeValue || 'upload';
+    }
+    updateReferenceSummary();
+  }
+
+  function renderReferenceStrip() {
+    if (!referenceStrip) return;
+    refreshReferenceMentionLabels();
+    syncPromptRichInputFromTextarea();
+    referenceStrip.innerHTML = '';
+    if (!referenceImages.length) {
+      const empty = document.createElement('div');
+      empty.className = 'reference-empty';
+      empty.textContent = `可上传 / 粘贴 / 拖拽参考图（最多 ${REFERENCE_LIMIT} 张）`;
+      referenceStrip.appendChild(empty);
+      updateReferenceMeta();
+      return;
+    }
+
+    referenceImages.forEach((item) => {
+      const index = referenceImages.findIndex((ref) => ref.id === item.id);
+      const card = document.createElement('div');
+      card.className = 'reference-item';
+      card.dataset.id = item.id;
+      if (item.id === selectedReferenceId) {
+        card.classList.add('is-active');
+      }
+      card.title = item.parentPostId ? `parentPostId: ${item.parentPostId}` : '点击切换预览';
+
+      const img = document.createElement('img');
+      img.src = item.previewUrl || item.sourceUrl || item.url || '';
+      img.alt = item.parentPostId ? `parentPostId: ${item.parentPostId}` : '参考图';
+      img.addEventListener('click', () => {
+        selectedReferenceId = item.id;
+        renderReferenceStrip();
+        setReferencePreviewItems(referenceImages);
+      });
+
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'reference-remove';
+      removeBtn.textContent = '×';
+      removeBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        removeReferenceItem(item.id);
+      });
+
+      card.appendChild(img);
+      card.appendChild(removeBtn);
+      const badge = document.createElement('div');
+      badge.className = 'reference-badge';
+      badge.textContent = item.mentionLabel || getReferenceMentionLabel(Math.max(0, index));
+      card.appendChild(badge);
+      referenceStrip.appendChild(card);
+    });
+
+    if (referenceImages.length < REFERENCE_LIMIT && imageFileInput) {
+      const addSlot = document.createElement('button');
+      addSlot.type = 'button';
+      addSlot.className = 'reference-add-slot';
+      addSlot.textContent = '+';
+      addSlot.title = '继续添加';
+      addSlot.addEventListener('click', () => imageFileInput.click());
+      referenceStrip.appendChild(addSlot);
+    }
+    updateReferenceMeta();
+  }
+
+  function clearReferencePreview() {
+    if (currentGallery) {
+      currentGallery.innerHTML = '';
+      currentGallery.classList.add('hidden');
+      currentGallery.dataset.count = '0';
+    }
+    if (previewEmpty) {
+      previewEmpty.classList.remove('hidden');
+    }
+  }
+
+  function setReferencePreviewItems(items) {
+    const list = Array.isArray(items) ? items.filter(Boolean) : [];
+    if (!currentGallery || !referencePreview) return;
+    if (!list.length) {
+      selectedReferenceId = '';
+      clearReferencePreview();
+      return;
+    }
+    const selected = list.find((item) => item.id === selectedReferenceId) || list[0];
+    selectedReferenceId = selected.id;
+    currentGallery.innerHTML = '';
+    currentGallery.dataset.count = '1';
+    currentGallery.classList.remove('hidden');
+    if (previewEmpty) {
+      previewEmpty.classList.add('hidden');
+    }
+    const box = document.createElement('div');
+    box.className = 'current-gallery-item current-gallery-item-single';
+    const img = document.createElement('img');
+    img.src = selected.previewUrl || selected.sourceUrl || selected.url || '';
+    img.alt = selected.parentPostId ? `parentPostId: ${selected.parentPostId}` : '参考图预览';
+    box.appendChild(img);
+    currentGallery.appendChild(box);
+  }
+
+  function removeReferenceItem(id) {
+    const before = referenceImages.length;
+    referenceImages = referenceImages.filter((item) => item.id !== id);
+    if (referenceImages.length === before) return;
+    if (!referenceImages.length) {
+      currentModeValue = 'upload';
+      selectedReferenceId = '';
+      if (imageUrlInput) imageUrlInput.value = '';
+      if (parentPostInput) parentPostInput.value = '';
+    } else {
+      const primary = referenceImages[0];
+      if (!referenceImages.some((item) => item.id === selectedReferenceId)) {
+        selectedReferenceId = primary.id;
+      }
+      if (imageUrlInput) {
+        imageUrlInput.value = primary.sourceUrl || primary.url || '';
+      }
+      if (parentPostInput) {
+        parentPostInput.value = primary.parentPostId || '';
+      }
+      currentModeValue = primary.parentPostId ? 'parent_post' : 'upload';
+    }
+    renderReferenceStrip();
+    setReferencePreviewItems(referenceImages);
+  }
+
+  function setReferenceItems(items, mode = 'upload') {
+    referenceImages = (Array.isArray(items) ? items : [])
+      .filter((item) => item && (item.previewUrl || item.sourceUrl || item.url))
+      .slice(0, REFERENCE_LIMIT)
+      .map((item, index) => enrichReferenceItem(item, index));
+    currentModeValue = mode;
+    const primary = referenceImages[0] || null;
+    selectedReferenceId = primary ? primary.id : '';
+    if (imageUrlInput) {
+      imageUrlInput.value = primary ? (primary.sourceUrl || primary.url || '') : '';
+    }
+    if (parentPostInput) {
+      parentPostInput.value = primary ? (primary.parentPostId || '') : '';
+    }
+    renderReferenceStrip();
+    setReferencePreviewItems(referenceImages);
+    syncPromptRichInputFromTextarea();
+  }
+
+  function hideReferenceMentionMenu() {
+    activeMentionIndex = -1;
+    if (!referenceMentionMenu) return;
+    referenceMentionMenu.classList.add('hidden');
+    referenceMentionMenu.innerHTML = '';
+    lastMentionContext = null;
+  }
+
+  function getPromptMentionCandidates() {
+    return referenceImages.map((item, index) => ({
+      id: item.id,
+      label: String(item.mentionLabel || getReferenceMentionLabel(index)).trim(),
+      token: `@${String(item.mentionLabel || getReferenceMentionLabel(index)).trim()}`,
+      originalId: String(item.parentPostId || '').trim(),
+      imageUrl: String(item.previewUrl || item.sourceUrl || item.url || '').trim()
+    }));
+  }
+
+  function updatePromptEditorEmptyState() {
+    if (!promptRichInput) return;
+    const hasContent = Array.from(promptRichInput.childNodes).some((node) => {
+      if (node.nodeType === Node.TEXT_NODE) return String(node.textContent || '').length > 0;
+      if (node.nodeType === Node.ELEMENT_NODE) return true;
+      return false;
+    });
+    promptRichInput.classList.toggle('is-empty', !hasContent);
+  }
+
+  function createMentionChip(candidate) {
+    const chip = document.createElement('span');
+    chip.className = 'prompt-mention-chip react-renderer node-mention inline-flex align-middle';
+    chip.contentEditable = 'false';
+    chip.dataset.mentionToken = candidate.token;
+    chip.dataset.mentionLabel = candidate.label;
+    chip.dataset.originalId = candidate.originalId || '';
+    chip.tabIndex = 0;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'prompt-mention-chip-inner inline-flex items-center';
+    wrapper.dataset.mentionType = 'attachment';
+    wrapper.dataset.nodeViewWrapper = '';
+    wrapper.style.whiteSpace = 'normal';
+
+    if (candidate.imageUrl) {
+      const thumbWrap = document.createElement('div');
+      thumbWrap.className = 'prompt-mention-chip-thumb-wrap';
+
+      const thumb = document.createElement('img');
+      thumb.className = 'prompt-mention-chip-thumb';
+      thumb.src = candidate.imageUrl;
+      thumb.alt = '';
+      thumbWrap.appendChild(thumb);
+      wrapper.appendChild(thumbWrap);
+    }
+
+    const label = document.createElement('span');
+    label.className = 'prompt-mention-chip-label';
+    label.textContent = candidate.token;
+    wrapper.appendChild(label);
+    chip.appendChild(wrapper);
+    return chip;
+  }
+
+  function clearActivePromptChip() {
+    if (!promptRichInput) return;
+    promptRichInput.querySelectorAll('.prompt-mention-chip.is-active').forEach((node) => {
+      node.classList.remove('is-active');
+    });
+  }
+
+  function getSelectedPromptChip() {
+    if (!promptRichInput || !window.getSelection) return null;
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return null;
+    const range = selection.getRangeAt(0);
+    const startNode = range.startContainer;
+    if (startNode && startNode.nodeType === Node.ELEMENT_NODE && startNode.classList && startNode.classList.contains('prompt-mention-chip')) {
+      return startNode;
+    }
+    const parent = startNode && startNode.parentElement ? startNode.parentElement.closest('.prompt-mention-chip') : null;
+    return parent && promptRichInput.contains(parent) ? parent : null;
+  }
+
+  function selectPromptChip(chip) {
+    if (!chip || !promptRichInput) return;
+    clearActivePromptChip();
+    chip.classList.add('is-active');
+    const selection = window.getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    range.selectNode(chip);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    promptRichInput.focus();
+  }
+
+  function getChipAdjacentToSelection(direction = 'backward') {
+    if (!promptRichInput || !window.getSelection) return null;
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return null;
+    const range = selection.getRangeAt(0);
+    const startNode = range.startContainer;
+    const offset = range.startOffset;
+
+    if (range.collapsed) {
+      if (startNode.nodeType === Node.TEXT_NODE) {
+        const textLength = String(startNode.textContent || '').length;
+        if (direction === 'backward' && offset !== 0) {
+          return null;
+        }
+        if (direction === 'forward' && offset !== textLength) {
+          return null;
+        }
+        const sibling = direction === 'backward' ? startNode.previousSibling : startNode.nextSibling;
+        if (sibling && sibling.nodeType === Node.ELEMENT_NODE && sibling.classList && sibling.classList.contains('prompt-mention-chip')) {
+          return sibling;
+        }
+      } else if (startNode.nodeType === Node.ELEMENT_NODE) {
+        const neighbour = direction === 'backward' ? startNode.childNodes[offset - 1] : startNode.childNodes[offset];
+        if (neighbour && neighbour.nodeType === Node.TEXT_NODE) {
+          const neighbourText = String(neighbour.textContent || '');
+          if (neighbourText.length > 0) {
+            return null;
+          }
+        }
+        const index = direction === 'backward' ? offset - 1 : offset;
+        const candidate = startNode.childNodes[index];
+        if (candidate && candidate.nodeType === Node.ELEMENT_NODE && candidate.classList && candidate.classList.contains('prompt-mention-chip')) {
+          return candidate;
+        }
+      }
+    } else if (startNode.nodeType === Node.ELEMENT_NODE && startNode.classList && startNode.classList.contains('prompt-mention-chip')) {
+      return startNode;
+    }
+    return null;
+  }
+
+  function hasEditableTextNearSelection(direction = 'backward') {
+    if (!promptRichInput || !window.getSelection) return false;
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return false;
+    const range = selection.getRangeAt(0);
+    if (!range.collapsed) return false;
+    const startNode = range.startContainer;
+    const offset = range.startOffset;
+
+    if (startNode.nodeType === Node.TEXT_NODE) {
+      const text = String(startNode.textContent || '');
+      return direction === 'backward' ? offset > 0 : offset < text.length;
+    }
+
+    if (startNode.nodeType === Node.ELEMENT_NODE) {
+      const neighbour = direction === 'backward' ? startNode.childNodes[offset - 1] : startNode.childNodes[offset];
+      if (!neighbour) return false;
+      if (neighbour.nodeType === Node.TEXT_NODE) {
+        return String(neighbour.textContent || '').length > 0;
+      }
+      return false;
+    }
+
+    return false;
+  }
+
+  function serializePromptRichInput() {
+    if (!promptRichInput) return '';
+    const parts = [];
+    promptRichInput.childNodes.forEach((node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        parts.push(node.textContent || '');
+        return;
+      }
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node;
+        if (el.classList && el.classList.contains('prompt-mention-chip')) {
+          parts.push(el.dataset.mentionToken || el.textContent || '');
+        } else {
+          parts.push(el.textContent || '');
+        }
+      }
+    });
+    return parts.join('');
+  }
+
+  function setPromptTextareaValue(value) {
+    if (!promptInput) return;
+    if (promptInput.value === value) return;
+    isSyncingPromptEditor = true;
+    promptInput.value = value;
+    promptInput.dispatchEvent(new Event('input', { bubbles: true }));
+    isSyncingPromptEditor = false;
+  }
+
+  function resolvePromptMentionContext(range) {
+    if (!promptRichInput || !range) return null;
+    if (!promptRichInput.contains(range.startContainer)) return null;
+    if (range.startContainer.nodeType !== Node.TEXT_NODE) return null;
+    const textNode = range.startContainer;
+    const before = String(textNode.textContent || '').slice(0, range.startOffset);
+    const match = before.match(/@([^\s@]*)$/);
+    if (!match) return null;
+    return {
+      textNode,
+      startOffset: before.length - match[1].length - 1,
+      endOffset: range.startOffset,
+      query: match[1] || ''
+    };
+  }
+
+  function getMentionContext() {
+    if (!promptRichInput) return null;
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return null;
+    return resolvePromptMentionContext(selection.getRangeAt(0));
+  }
+
+  function setCaretAfterNode(node) {
+    if (!promptRichInput || !node) return;
+    const range = document.createRange();
+    range.setStartAfter(node);
+    range.collapse(true);
+    const selection = window.getSelection();
+    if (!selection) return;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    promptRichInput.focus();
+  }
+
+  function syncPromptTextareaFromRichInput() {
+    const value = serializePromptRichInput();
+    setPromptTextareaValue(value);
+    clearActivePromptChip();
+    updatePromptEditorEmptyState();
+  }
+
+  function rebuildPromptRichInputFromText(value) {
+    if (!promptRichInput) return;
+    const raw = String(value || '');
+    const tokenMap = new Map();
+    getPromptMentionCandidates().forEach((item) => {
+      tokenMap.set(item.token, item);
+      if (item.originalId) {
+        tokenMap.set(`@${item.originalId}`, item);
+      }
+    });
+
+    promptRichInput.innerHTML = '';
+    const tokenPattern = /@Image\s+\d+|@[0-9a-fA-F-]{32,36}/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = tokenPattern.exec(raw)) !== null) {
+      const [token] = match;
+      if (match.index > lastIndex) {
+        promptRichInput.appendChild(document.createTextNode(raw.slice(lastIndex, match.index)));
+      }
+      const candidate = tokenMap.get(token);
+      if (candidate) {
+        promptRichInput.appendChild(createMentionChip(candidate));
+      } else {
+        promptRichInput.appendChild(document.createTextNode(token));
+      }
+      lastIndex = match.index + token.length;
+    }
+    if (lastIndex < raw.length) {
+      promptRichInput.appendChild(document.createTextNode(raw.slice(lastIndex)));
+    }
+    updatePromptEditorEmptyState();
+  }
+
+  function syncPromptRichInputFromTextarea() {
+    if (!promptInput || !promptRichInput || isSyncingPromptEditor) return;
+    rebuildPromptRichInputFromText(promptInput.value || '');
+  }
+
+  function normalizePromptRichInputTokens(moveCaretToEnd = true) {
+    if (!promptRichInput) return;
+    rebuildPromptRichInputFromText(serializePromptRichInput());
+    if (moveCaretToEnd) {
+      const selection = window.getSelection();
+      if (selection) {
+        const range = document.createRange();
+        range.selectNodeContents(promptRichInput);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+    }
+    syncPromptTextareaFromRichInput();
+  }
+
+  function insertMentionLabel(labelOrCandidate) {
+    if (!promptRichInput) return;
+    const candidate = typeof labelOrCandidate === 'string'
+      ? getPromptMentionCandidates().find((item) => item.label === labelOrCandidate)
+      : labelOrCandidate;
+    if (!candidate) return;
+
+    const selection = window.getSelection();
+    let range = null;
+    if (selection && selection.rangeCount) {
+      const currentRange = selection.getRangeAt(0);
+      if (promptRichInput.contains(currentRange.startContainer)) {
+        range = currentRange.cloneRange();
+      }
+    }
+    if (!range && lastMentionRange) {
+      range = lastMentionRange.cloneRange();
+    }
+    const context = resolvePromptMentionContext(range) || lastMentionContext;
+    if (!context) {
+      const chip = createMentionChip(candidate);
+      promptRichInput.appendChild(chip);
+      promptRichInput.appendChild(document.createTextNode(' '));
+      normalizePromptRichInputTokens(true);
+      hideReferenceMentionMenu();
+      return;
+    }
+
+    if (context.textNode) {
+      const raw = String(context.textNode.textContent || '');
+      context.textNode.textContent = `${raw.slice(0, context.startOffset)}${raw.slice(context.endOffset)}`;
+      const workingRange = document.createRange();
+      workingRange.setStart(context.textNode, context.startOffset);
+      workingRange.collapse(true);
+      if (selection) {
+        selection.removeAllRanges();
+        selection.addRange(workingRange);
+      }
+      range = workingRange;
+    }
+
+    const chip = createMentionChip(candidate);
+    range.insertNode(chip);
+    const trailingSpace = document.createTextNode(' ');
+    chip.after(trailingSpace);
+    setCaretAfterNode(trailingSpace);
+    syncPromptTextareaFromRichInput();
+    hideReferenceMentionMenu();
+  }
+
+  function renderReferenceMentionMenu() {
+    if (!referenceMentionMenu || !promptRichInput) return;
+    const ctx = getMentionContext();
+    if (!ctx || !referenceImages.length) {
+      hideReferenceMentionMenu();
+      return;
+    }
+    const query = String(ctx.query || '').trim().toLowerCase();
+    lastMentionContext = ctx;
+    lastMentionRange = window.getSelection() && window.getSelection().rangeCount
+      ? window.getSelection().getRangeAt(0).cloneRange()
+      : lastMentionRange;
+    const candidates = getPromptMentionCandidates().filter((item) => {
+      return !query || item.label.toLowerCase().includes(query) || item.token.toLowerCase().includes(query);
+    });
+    if (!candidates.length) {
+      hideReferenceMentionMenu();
+      return;
+    }
+    if (activeMentionIndex < 0 || activeMentionIndex >= candidates.length) {
+      activeMentionIndex = 0;
+    }
+
+    referenceMentionMenu.innerHTML = '';
+    candidates.forEach((item, index) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'reference-mention-item';
+      if (index === activeMentionIndex) {
+        button.classList.add('is-active');
+      }
+      button.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+        insertMentionLabel(item);
+      });
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        insertMentionLabel(item);
+      });
+
+      if (item.imageUrl) {
+        const thumb = document.createElement('img');
+        thumb.className = 'reference-mention-thumb';
+        thumb.src = item.imageUrl;
+        thumb.alt = item.label;
+        button.appendChild(thumb);
+      }
+
+      const label = document.createElement('div');
+      label.className = 'reference-mention-label';
+      label.textContent = item.label;
+      button.appendChild(label);
+
+      referenceMentionMenu.appendChild(button);
+    });
+    referenceMentionMenu.classList.remove('hidden');
+  }
+
   function applyParentPostReference(text, options = {}) {
     const silent = Boolean(options.silent);
     const resolved = resolveReferenceByText(text);
@@ -398,86 +1002,18 @@
       }
       return false;
     }
-    if (imageUrlInput) {
-      imageUrlInput.value = finalSourceUrl || finalPreviewUrl || '';
-    }
-    if (parentPostInput) {
-      parentPostInput.value = finalParentId;
-    }
-
-    // 仅清空本地图片变量，不调用全局 clearFileSelection 避免清空自身输入框
-    fileDataUrl = '';
-    if (imageFileInput) {
-      imageFileInput.value = '';
-    }
-    if (imageFileName) {
-      imageFileName.textContent = '未选择文件';
-    }
-
-    setReferencePreview(finalPreviewUrl, finalParentId);
+    setReferenceItems([{
+      id: makeReferenceId('parent'),
+      previewUrl: finalPreviewUrl,
+      sourceUrl: finalSourceUrl || finalPreviewUrl,
+      url: finalPreviewUrl,
+      parentPostId: finalParentId,
+      name: finalParentId || 'parentPostId'
+    }], 'parent_post');
     if (!silent) {
       toast('已使用 parentPostId 填充参考图', 'success');
     }
     return true;
-  }
-
-  function clearReferencePreview() {
-    if (!referencePreview) return;
-    referencePreview.classList.add('hidden');
-    if (referencePreviewImg) {
-      referencePreviewImg.removeAttribute('src');
-    }
-    if (referencePreviewMeta) {
-      referencePreviewMeta.textContent = '';
-    }
-  }
-
-  function buildReferencePreviewMeta(url, parentPostId) {
-    const raw = String(url || '').trim();
-    if (parentPostId) {
-      return `parentPostId: ${parentPostId}`;
-    }
-    if (!raw) return '';
-    if (raw.startsWith('data:image/')) {
-      return '本地图片（Base64 已隐藏）';
-    }
-    return raw;
-  }
-
-  function setReferencePreview(url, parentPostId) {
-    const safeUrl = String(url || '').trim();
-    if (!safeUrl || !referencePreview || !referencePreviewImg) {
-      clearReferencePreview();
-      return;
-    }
-    referencePreview.classList.remove('hidden');
-    referencePreviewImg.src = safeUrl;
-    referencePreviewImg.alt = parentPostId ? `parentPostId: ${parentPostId}` : '参考图预览';
-    referencePreviewImg.onerror = () => {
-      if (!parentPostId) return;
-      const api = getParentMemoryApi();
-      const memoryHit = api && typeof api.getByParentPostId === 'function'
-        ? api.getByParentPostId(parentPostId)
-        : null;
-      const candidates = [
-        memoryHit && memoryHit.imageUrl,
-        memoryHit && memoryHit.sourceImageUrl,
-        api && typeof api.buildImaginePublicUrl === 'function'
-          ? String(api.buildImaginePublicUrl(parentPostId) || '').trim()
-          : `https://imagine-public.x.ai/imagine-public/images/${parentPostId}.jpg`,
-      ].map((it) => String(it || '').trim()).filter(Boolean);
-      for (const next of candidates) {
-        if (next === safeUrl || referencePreviewImg.src === next) {
-          continue;
-        }
-        referencePreviewImg.src = next;
-        return;
-      }
-      referencePreviewImg.onerror = null;
-    };
-    if (referencePreviewMeta) {
-      referencePreviewMeta.textContent = buildReferencePreviewMeta(safeUrl, parentPostId);
-    }
   }
 
   function setStatus(state, text) {
@@ -585,6 +1121,9 @@
     const title = document.createElement('div');
     title.className = 'video-item-title';
     title.textContent = `视频 ${previewCount}`;
+    
+    const prompt = document.createElement('div');
+    prompt.className = 'video-item-prompt hidden';
 
     const actions = document.createElement('div');
     actions.className = 'video-item-actions video-item-actions-overlay';
@@ -611,6 +1150,7 @@
     actions.appendChild(downloadBtn);
     actions.appendChild(editBtn);
     header.appendChild(title);
+    header.appendChild(prompt);
 
     const body = document.createElement('div');
     body.className = 'video-item-body';
@@ -693,12 +1233,8 @@
   }
 
   function clearFileSelection() {
-    fileDataUrl = '';
     if (imageFileInput) {
       imageFileInput.value = '';
-    }
-    if (imageFileName) {
-      imageFileName.textContent = '未选择文件';
     }
     if (imageUrlInput) {
       imageUrlInput.value = '';
@@ -706,6 +1242,9 @@
     if (parentPostInput) {
       parentPostInput.value = '';
     }
+    referenceImages = [];
+    currentModeValue = 'upload';
+    renderReferenceStrip();
     clearReferencePreview();
   }
 
@@ -726,27 +1265,25 @@
     return Array.from(types).includes('Files');
   }
 
-  function pickImageFileFromDataTransfer(dataTransfer) {
-    if (!dataTransfer) return null;
+  function pickImageFilesFromDataTransfer(dataTransfer) {
+    if (!dataTransfer) return [];
+    const files = [];
+    const pushIfImage = (file) => {
+      if (!file) return;
+      if (!String(file.type || '').startsWith('image/')) return;
+      files.push(file);
+    };
     if (dataTransfer.files && dataTransfer.files.length) {
-      for (const file of dataTransfer.files) {
-        if (file && String(file.type || '').startsWith('image/')) {
-          return file;
-        }
-      }
+      Array.from(dataTransfer.files).forEach(pushIfImage);
     }
-    if (dataTransfer.items && dataTransfer.items.length) {
-      for (const item of dataTransfer.items) {
-        if (!item) continue;
-        if (item.kind === 'file') {
-          const file = item.getAsFile ? item.getAsFile() : null;
-          if (file && String(file.type || '').startsWith('image/')) {
-            return file;
-          }
-        }
-      }
+    if (!files.length && dataTransfer.items && dataTransfer.items.length) {
+      Array.from(dataTransfer.items).forEach((item) => {
+        if (!item || item.kind !== 'file') return;
+        const file = item.getAsFile ? item.getAsFile() : null;
+        pushIfImage(file);
+      });
     }
-    return null;
+    return files;
   }
 
   function setRefDragActive(active) {
@@ -754,34 +1291,52 @@
     refDropZone.classList.toggle('dragover', Boolean(active));
   }
 
-  async function applyReferenceImageFile(file, sourceLabel) {
-    if (!file) return;
-    const mimeType = String(file.type || '');
-    if (mimeType && !mimeType.startsWith('image/')) {
-      toast('仅支持图片文件', 'warning');
-      return;
+  async function applyReferenceImageFiles(files, sourceLabel) {
+    const targets = Array.isArray(files) ? files.filter(Boolean) : [];
+    if (!targets.length) return 0;
+    const slotsLeft = Math.max(0, REFERENCE_LIMIT - referenceImages.length);
+    if (slotsLeft <= 0) {
+      toast(`最多支持 ${REFERENCE_LIMIT} 张参考图`, 'warning');
+      return 0;
     }
-    const dataUrl = await readFileAsDataUrl(file);
-    if (!dataUrl.startsWith('data:image/')) {
-      throw new Error('图片格式不受支持');
+    const accepted = targets.slice(0, slotsLeft);
+    let added = 0;
+    for (const file of accepted) {
+      const mimeType = String(file.type || '');
+      if (mimeType && !mimeType.startsWith('image/')) {
+        continue;
+      }
+      const dataUrl = await readFileAsDataUrl(file);
+      if (!dataUrl.startsWith('data:image/')) {
+        continue;
+      }
+      referenceImages.push({
+        id: makeReferenceId('upload'),
+        previewUrl: dataUrl,
+        sourceUrl: dataUrl,
+        url: dataUrl,
+        parentPostId: '',
+        name: file.name || sourceLabel || '已选择图片',
+        mentionLabel: getReferenceMentionLabel(referenceImages.length)
+      });
+      added += 1;
     }
-    fileDataUrl = dataUrl;
     if (imageUrlInput) {
       imageUrlInput.value = '';
     }
     if (parentPostInput) {
       parentPostInput.value = '';
     }
-    if (imageFileInput) {
-      imageFileInput.value = '';
+    currentModeValue = 'upload';
+    renderReferenceStrip();
+    setReferencePreviewItems(referenceImages);
+    if (sourceLabel && added > 0) {
+      toast(`${sourceLabel}已载入 ${added} 张`, 'success');
     }
-    if (imageFileName) {
-      imageFileName.textContent = file.name || sourceLabel || '已选择图片';
+    if (targets.length > accepted.length) {
+      toast(`最多支持 ${REFERENCE_LIMIT} 张参考图，已忽略超出部分`, 'warning');
     }
-    setReferencePreview(fileDataUrl, '');
-    if (sourceLabel) {
-      toast(`${sourceLabel}已载入`, 'success');
-    }
+    return added;
   }
 
   function normalizeAuthHeader(authHeader) {
@@ -815,26 +1370,34 @@
     const prompt = promptInput ? promptInput.value.trim() : '';
     const rawUrl = imageUrlInput ? imageUrlInput.value.trim() : '';
     const rawParent = parentPostInput ? parentPostInput.value.trim() : '';
-    if (fileDataUrl && rawUrl) {
-      toast('参考图只能选择其一：URL/Base64 或 本地上传', 'error');
-      throw new Error('invalid_reference');
+    let refs = Array.isArray(referenceImages) ? referenceImages.slice() : [];
+    if (!refs.length && (rawParent || rawUrl)) {
+      const resolvedRef = resolveReferenceByText(rawParent || rawUrl);
+      const manualRef = {
+        id: makeReferenceId('manual'),
+        previewUrl: resolvedRef.url || resolvedRef.sourceUrl || rawUrl,
+        sourceUrl: resolvedRef.sourceUrl || rawUrl,
+        url: resolvedRef.url || resolvedRef.sourceUrl || rawUrl,
+        parentPostId: rawParent || resolvedRef.parentPostId || '',
+        name: 'manual'
+      };
+      refs = [manualRef];
+      setReferenceItems(refs, manualRef.parentPostId ? 'parent_post' : 'upload');
     }
-    let resolvedRef = { url: '', sourceUrl: '', parentPostId: '' };
-    if (!fileDataUrl) {
-      resolvedRef = resolveReferenceByText(rawParent || rawUrl);
-    }
-    const parentPostId = fileDataUrl ? '' : (rawParent || resolvedRef.parentPostId || '').trim();
-    const imageUrl = fileDataUrl ? fileDataUrl : (parentPostId ? (rawUrl || resolvedRef.sourceUrl || '') : (rawUrl || resolvedRef.url || ''));
 
-    if (!fileDataUrl && (resolvedRef.parentPostId || parentPostId)) {
-      if (imageUrlInput && !imageUrlInput.value.trim() && (resolvedRef.sourceUrl || resolvedRef.url)) {
-        imageUrlInput.value = resolvedRef.sourceUrl || resolvedRef.url;
-      }
-      if (parentPostInput && !parentPostInput.value.trim() && (resolvedRef.parentPostId || parentPostId)) {
-        parentPostInput.value = resolvedRef.parentPostId || parentPostId;
-      }
-      setReferencePreview(resolvedRef.url || resolvedRef.sourceUrl || imageUrl, resolvedRef.parentPostId || parentPostId);
-    }
+    const referenceItems = refs.map((item, index) => ({
+      parent_post_id: String(item && item.parentPostId ? item.parentPostId : '').trim(),
+      image_url: String(item && (item.sourceUrl || item.url) ? (item.sourceUrl || item.url) : '').trim(),
+      source_image_url: String(item && item.sourceUrl ? item.sourceUrl : '').trim(),
+      mention_alias: String(item && item.mentionLabel ? item.mentionLabel : getReferenceMentionLabel(index)).trim()
+    })).filter((item) => item.parent_post_id || item.image_url || item.source_image_url);
+
+    const hasReferenceItems = referenceItems.length > 0;
+    const primaryRef = hasReferenceItems ? null : (referenceItems[0] || null);
+    const parentPostId = primaryRef ? String(primaryRef.parent_post_id || '').trim() : '';
+    const imageUrl = primaryRef ? String(primaryRef.image_url || primaryRef.source_image_url || '').trim() : '';
+    const sourceImageUrl = primaryRef ? String(primaryRef.source_image_url || primaryRef.image_url || '').trim() : '';
+
     const res = await fetch('/v1/public/video/start', {
       method: 'POST',
       headers: {
@@ -843,14 +1406,16 @@
       },
       body: JSON.stringify({
         prompt,
-        image_url: parentPostId ? null : (imageUrl || null),
-        parent_post_id: parentPostId || null,
-        source_image_url: parentPostId ? (resolvedRef.sourceUrl || imageUrl || null) : null,
+        image_url: hasReferenceItems ? null : (parentPostId ? null : (imageUrl || null)),
+        parent_post_id: hasReferenceItems ? null : (parentPostId || null),
+        source_image_url: hasReferenceItems ? null : (parentPostId ? (sourceImageUrl || null) : null),
+        reference_items: referenceItems,
         reasoning_effort: DEFAULT_REASONING_EFFORT,
         aspect_ratio: ratioSelect ? ratioSelect.value : '3:2',
         video_length: lengthSelect ? parseInt(lengthSelect.value, 10) : 6,
         resolution_name: resolutionSelect ? resolutionSelect.value : '480p',
         preset: presetSelect ? presetSelect.value : 'normal',
+        single_image_mode: singleImageModeSelect ? singleImageModeSelect.value : 'frame',
         concurrent: getConcurrentValue()
       })
     });
@@ -973,6 +1538,21 @@
     if (title) {
       title.textContent = String(text || '');
     }
+  }
+
+  function setPreviewPrompt(item, text) {
+    if (!item) return;
+    const promptEl = item.querySelector('.video-item-prompt');
+    const promptText = String(text || '').trim();
+    item.dataset.prompt = promptText;
+    if (!promptEl) return;
+    if (promptText) {
+      promptEl.textContent = promptText;
+      promptEl.classList.remove('hidden');
+      return;
+    }
+    promptEl.textContent = '';
+    promptEl.classList.add('hidden');
   }
 
   function getSelectedVideoItem() {
@@ -1384,6 +1964,7 @@
     updateMeta();
     resetOutput(true);
     setStatus('connecting', '连接中');
+    const promptText = promptInput ? String(promptInput.value || '').trim() : '';
 
     let taskIds = [];
     try {
@@ -1407,6 +1988,7 @@
     for (const taskId of taskIds) {
       const previewItem = initPreviewSlot();
       setPreviewTitle(previewItem, buildHistoryTitle('generated', previewItem && previewItem.dataset ? previewItem.dataset.index : previewCount));
+      setPreviewPrompt(previewItem, promptText);
       taskStates.set(taskId, {
         taskId,
         source: null,
@@ -1523,6 +2105,7 @@
         video_length: lengthSelect ? parseInt(lengthSelect.value, 10) : 6,
         resolution_name: resolutionSelect ? resolutionSelect.value : '480p',
         preset: presetSelect ? presetSelect.value : 'custom',
+        single_image_mode: 'frame',
         concurrent,
         n: concurrent,
         edit_context: editCtx
@@ -1681,7 +2264,7 @@
     startElapsedTimer();
     try {
       const nextRound = editingRound + 1;
-      const basePreset = presetSelect ? presetSelect.value : 'normal';
+      const concurrent = getConcurrentValue();
 
       const body = {
         prompt: prompt,
@@ -1690,7 +2273,7 @@
         resolution_name: resolutionSelect ? resolutionSelect.value : '480p',
         preset: (!prompt || prompt.trim() === '') ? 'spicy' : (presetSelect ? presetSelect.value : 'normal'),
         reasoning_effort: typeof DEFAULT_REASONING_EFFORT !== 'undefined' ? DEFAULT_REASONING_EFFORT : null,
-        concurrent: 1,
+        concurrent,
         is_video_extension: true,
         extend_post_id: currentExtendPostId,
         video_extension_start_time: extensionStartTime,
@@ -1721,6 +2304,7 @@
       for (const tid of taskIds) {
         const placeholder = initPreviewSlot();
         setPreviewTitle(placeholder, buildHistoryTitle('splice', serial));
+        setPreviewPrompt(placeholder, prompt);
         if (placeholder) placeholder.dataset.taskId = tid;
         spliceRun.placeholders.set(tid, placeholder);
       }
@@ -2199,15 +2783,14 @@
 
   if (imageFileInput) {
     imageFileInput.addEventListener('change', async () => {
-      const file = imageFileInput.files && imageFileInput.files[0];
-      if (!file) {
+      const files = imageFileInput.files ? Array.from(imageFileInput.files) : [];
+      if (!files.length) {
         clearFileSelection();
         return;
       }
       try {
-        await applyReferenceImageFile(file, '上传图片');
+        await applyReferenceImageFiles(files, '上传图片');
       } catch (e) {
-        fileDataUrl = '';
         toast(String(e && e.message ? e.message : '文件读取失败'), 'error');
         clearReferencePreview();
       }
@@ -2242,7 +2825,7 @@
     parentPostInput.addEventListener('input', () => {
       const raw = parentPostInput.value.trim();
       if (!raw) {
-        if (!fileDataUrl) {
+        if (!referenceImages.length) {
           clearReferencePreview();
         }
         return;
@@ -2253,6 +2836,7 @@
       const text = String(event.clipboardData ? event.clipboardData.getData('text') || '' : '').trim();
       if (!text) return;
       event.preventDefault();
+      event.stopPropagation();
       parentPostInput.value = text;
       applyParentPostReference(text, { silent: true });
     });
@@ -2265,7 +2849,7 @@
         if (parentPostInput) {
           parentPostInput.value = '';
         }
-        if (!fileDataUrl) {
+        if (!referenceImages.length) {
           clearReferencePreview();
         }
         return;
@@ -2281,17 +2865,20 @@
       if (resolved.parentPostId && parentPostInput) {
         parentPostInput.value = resolved.parentPostId;
       }
-      if (raw && fileDataUrl) {
-        fileDataUrl = '';
-        if (imageFileInput) imageFileInput.value = '';
-        if (imageFileName) imageFileName.textContent = '未选择文件';
-      }
-      setReferencePreview(resolved.url || resolved.sourceUrl || raw, resolved.parentPostId || '');
+      setReferenceItems([{
+        id: makeReferenceId('url'),
+        previewUrl: resolved.url || resolved.sourceUrl || raw,
+        sourceUrl: resolved.sourceUrl || raw,
+        url: resolved.url || resolved.sourceUrl || raw,
+        parentPostId: resolved.parentPostId || '',
+        name: 'url'
+      }], resolved.parentPostId ? 'parent_post' : 'upload');
     });
     imageUrlInput.addEventListener('paste', (event) => {
       const text = String(event.clipboardData ? event.clipboardData.getData('text') || '' : '').trim();
       if (!text) return;
       event.preventDefault();
+      event.stopPropagation();
       imageUrlInput.value = text;
       const applied = applyParentPostReference(text, { silent: true });
       if (!applied) {
@@ -2299,12 +2886,14 @@
         if (resolved.parentPostId && parentPostInput) {
           parentPostInput.value = resolved.parentPostId;
         }
-        if (fileDataUrl) {
-          fileDataUrl = '';
-          if (imageFileInput) imageFileInput.value = '';
-          if (imageFileName) imageFileName.textContent = '未选择文件';
-        }
-        setReferencePreview(resolved.url || resolved.sourceUrl || text, resolved.parentPostId || '');
+        setReferenceItems([{
+          id: makeReferenceId('url'),
+          previewUrl: resolved.url || resolved.sourceUrl || text,
+          sourceUrl: resolved.sourceUrl || text,
+          url: resolved.url || resolved.sourceUrl || text,
+          parentPostId: resolved.parentPostId || '',
+          name: 'url'
+        }], resolved.parentPostId ? 'parent_post' : 'upload');
       }
     });
   }
@@ -2312,11 +2901,11 @@
   document.addEventListener('paste', async (event) => {
     const dataTransfer = event.clipboardData;
     if (!dataTransfer) return;
-    const imageFile = pickImageFileFromDataTransfer(dataTransfer);
-    if (imageFile) {
+    const imageFiles = pickImageFilesFromDataTransfer(dataTransfer);
+    if (imageFiles.length) {
       event.preventDefault();
       try {
-        await applyReferenceImageFile(imageFile, '粘贴图片');
+        await applyReferenceImageFiles(imageFiles, '粘贴图片');
       } catch (e) {
         toast(String(e && e.message ? e.message : '图片读取失败'), 'error');
       }
@@ -2325,8 +2914,11 @@
     const text = String(dataTransfer.getData('text') || '').trim();
     if (!text) return;
     const target = event.target;
-    const allowTarget = target === parentPostInput || target === imageUrlInput || !(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement);
-    if (!allowTarget || target === promptInput) {
+    const isTypingInPrompt = target === promptInput;
+    const isTypingInParentInput = target === parentPostInput;
+    const isTypingInImageUrlInput = target === imageUrlInput;
+    if (isTypingInPrompt) return;
+    if (!isTypingInParentInput && !isTypingInImageUrlInput && (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target?.isContentEditable)) {
       return;
     }
     const applied = applyParentPostReference(text, { silent: true });
@@ -2365,13 +2957,13 @@
       event.preventDefault();
       refDragCounter = 0;
       setRefDragActive(false);
-      const file = pickImageFileFromDataTransfer(event.dataTransfer);
-      if (!file) {
+      const files = pickImageFilesFromDataTransfer(event.dataTransfer);
+      if (!files.length) {
         toast('未检测到可用图片文件', 'warning');
         return;
       }
       try {
-        await applyReferenceImageFile(file, '拖拽图片');
+        await applyReferenceImageFiles(files, '拖拽图片');
       } catch (e) {
         toast(String(e && e.message ? e.message : '图片读取失败'), 'error');
       }
@@ -2393,16 +2985,114 @@
     setRefDragActive(false);
   });
 
-  if (promptInput) {
-    promptInput.addEventListener('keydown', (event) => {
+  if (promptRichInput) {
+    promptRichInput.addEventListener('input', () => {
+      syncPromptTextareaFromRichInput();
+      renderReferenceMentionMenu();
+    });
+    promptRichInput.addEventListener('click', (event) => {
+      const chip = event.target instanceof Element ? event.target.closest('.prompt-mention-chip') : null;
+      if (chip) {
+        event.preventDefault();
+        selectPromptChip(chip);
+        hideReferenceMentionMenu();
+        return;
+      }
+      clearActivePromptChip();
+      renderReferenceMentionMenu();
+    });
+    promptRichInput.addEventListener('focus', () => {
+      renderReferenceMentionMenu();
+    });
+    promptRichInput.addEventListener('blur', () => {
+      window.setTimeout(() => hideReferenceMentionMenu(), 120);
+    });
+    promptRichInput.addEventListener('keydown', (event) => {
+      const hasOpenMentionMenu = referenceMentionMenu && !referenceMentionMenu.classList.contains('hidden');
+      if (hasOpenMentionMenu && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+        const total = referenceMentionMenu.querySelectorAll('.reference-mention-item').length;
+        if (total > 0) {
+          event.preventDefault();
+          if (event.key === 'ArrowDown') {
+            activeMentionIndex = (activeMentionIndex + 1 + total) % total;
+          } else {
+            activeMentionIndex = (activeMentionIndex - 1 + total) % total;
+          }
+          renderReferenceMentionMenu();
+          return;
+        }
+      }
+      if (hasOpenMentionMenu && event.key === 'Enter') {
+        const active = referenceMentionMenu.querySelector('.reference-mention-item.is-active .reference-mention-label');
+        if (active) {
+          event.preventDefault();
+          const candidate = getPromptMentionCandidates().find((item) => item.label === (active.textContent || ''));
+          if (candidate) {
+            insertMentionLabel(candidate);
+          }
+          return;
+        }
+      }
+      if (hasOpenMentionMenu && event.key === 'Escape') {
+        hideReferenceMentionMenu();
+        return;
+      }
+      const selectedChip = getSelectedPromptChip();
+      if ((event.key === 'Backspace' || event.key === 'Delete') && selectedChip) {
+        event.preventDefault();
+        selectedChip.remove();
+        syncPromptTextareaFromRichInput();
+        return;
+      }
+      if (event.key === 'Backspace' && hasEditableTextNearSelection('backward')) {
+        return;
+      }
+      if (event.key === 'Delete' && hasEditableTextNearSelection('forward')) {
+        return;
+      }
+      if (event.key === 'Backspace' || event.key === 'Delete') {
+        const direction = event.key === 'Backspace' ? 'backward' : 'forward';
+        const adjacentChip = getChipAdjacentToSelection(direction);
+        if (adjacentChip) {
+          event.preventDefault();
+          if (adjacentChip.classList.contains('is-active')) {
+            adjacentChip.remove();
+            syncPromptTextareaFromRichInput();
+          } else {
+            selectPromptChip(adjacentChip);
+          }
+          return;
+        }
+      }
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        const adjacentChip = getChipAdjacentToSelection(event.key === 'ArrowLeft' ? 'backward' : 'forward');
+        if (adjacentChip) {
+          event.preventDefault();
+          selectPromptChip(adjacentChip);
+          return;
+        }
+      }
       if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
         event.preventDefault();
         startConnection();
       }
     });
   }
+  if (promptInput) {
+    promptInput.addEventListener('input', () => {
+      syncPromptRichInputFromTextarea();
+      renderReferenceMentionMenu();
+    });
+  }
 
-  [ratioSelect, lengthSelect, resolutionSelect, presetSelect, concurrentSelect]
+  document.addEventListener('click', (event) => {
+    if (!referenceMentionMenu || referenceMentionMenu.classList.contains('hidden')) return;
+    if (promptRichInput && promptRichInput.contains(event.target)) return;
+    if (referenceMentionMenu.contains(event.target)) return;
+    hideReferenceMentionMenu();
+  });
+
+  [ratioSelect, lengthSelect, resolutionSelect, presetSelect, concurrentSelect, singleImageModeSelect]
     .filter(Boolean)
     .forEach((el) => {
       el.addEventListener('change', updateMeta);
@@ -2413,6 +3103,7 @@
   refreshAllDeleteZoneTracks();
   syncTimelineAvailability();
   setSpliceButtonState('idle');
+  syncPromptRichInputFromTextarea();
 
   if (spliceBtn) {
     spliceBtn.addEventListener('click', () => {
@@ -2425,11 +3116,176 @@
   }
   if (imageUrlInput && imageUrlInput.value.trim()) {
     const resolved = resolveReferenceByText(imageUrlInput.value.trim());
-    setReferencePreview(resolved.url || resolved.sourceUrl || imageUrlInput.value.trim(), resolved.parentPostId || '');
+    setReferenceItems([{
+      id: makeReferenceId('init'),
+      previewUrl: resolved.url || resolved.sourceUrl || imageUrlInput.value.trim(),
+      sourceUrl: resolved.sourceUrl || imageUrlInput.value.trim(),
+      url: resolved.url || resolved.sourceUrl || imageUrlInput.value.trim(),
+      parentPostId: resolved.parentPostId || '',
+      name: 'init'
+    }], resolved.parentPostId ? 'parent_post' : 'upload');
     if (resolved.parentPostId && parentPostInput && !parentPostInput.value.trim()) {
       parentPostInput.value = resolved.parentPostId;
     }
   } else {
+    renderReferenceStrip();
     clearReferencePreview();
   }
+
+  // ─── 移动端底部 Sticky 操作栏逻辑 ───────────────────────────────────────
+  (function initMobileActionBar() {
+    const bar = document.getElementById('mobileActionBar');
+    if (!bar) return;
+
+    const slotGenerate    = document.getElementById('mobileBarGenerate');
+    const slotSplice      = document.getElementById('mobileBarSplice');
+    const mobileStart     = document.getElementById('mobileStartBtn');
+    const mobileStop      = document.getElementById('mobileStopBtn');
+    const mobileSplice    = document.getElementById('mobileSpliceBtn');
+    const settingsBtn     = document.getElementById('mobileSettingsBtn');
+    const settingsOverlay = document.getElementById('mobileSettingsOverlay');
+    // settings-card：作为 bottom sheet 使用
+    const settingsCard = document.querySelector('.video-settings-card');
+    let scOriginalParent = null;
+    let scOriginalNextSibling = null;
+
+    function isMobile() {
+      return window.matchMedia('(max-width: 768px)').matches;
+    }
+
+    // ── 将 settings-card 移到 body 直接子，避免祖先层叠上下文干扰 position:fixed ──
+    function moveCardToBody() {
+      if (!settingsCard || settingsCard.parentElement === document.body) return;
+      scOriginalParent = settingsCard.parentElement;
+      scOriginalNextSibling = settingsCard.nextElementSibling;
+      document.body.appendChild(settingsCard);
+    }
+
+    function moveCardBack() {
+      if (!settingsCard || settingsCard.parentElement !== document.body) return;
+      if (scOriginalParent) {
+        scOriginalNextSibling
+          ? scOriginalParent.insertBefore(settingsCard, scOriginalNextSibling)
+          : scOriginalParent.appendChild(settingsCard);
+      }
+    }
+
+    // ── 齿轮：生成参数 Bottom Sheet 开关 ──
+    function openSettingsSheet() {
+      document.body.classList.add('mobile-settings-open');
+      if (settingsBtn) settingsBtn.setAttribute('aria-expanded', 'true');
+    }
+
+    function closeSettingsSheet() {
+      document.body.classList.remove('mobile-settings-open');
+      if (settingsBtn) settingsBtn.setAttribute('aria-expanded', 'false');
+    }
+
+    if (settingsBtn) {
+      settingsBtn.addEventListener('click', () => {
+        document.body.classList.contains('mobile-settings-open')
+          ? closeSettingsSheet()
+          : openSettingsSheet();
+      });
+    }
+
+    // 点击遮罩关闭
+    if (settingsOverlay) {
+      settingsOverlay.addEventListener('click', closeSettingsSheet);
+    }
+
+    // Esc 键关闭
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && document.body.classList.contains('mobile-settings-open')) {
+        closeSettingsSheet();
+      }
+    });
+
+    // resize：移动端时把节点移到 body，桌面端时关闭 sheet 并移回原位
+    window.addEventListener('resize', () => {
+      if (isMobile()) {
+        moveCardToBody();
+      } else {
+        closeSettingsSheet();
+        moveCardBack();
+      }
+    });
+
+    // ── 按钮代理：点击 sticky bar 按钮 = 点击原始按钮 ──
+    if (mobileStart) {
+      mobileStart.addEventListener('click', () => {
+        const running = stopBtn && !stopBtn.classList.contains('hidden');
+        if (running) {
+          if (stopBtn && !stopBtn.disabled) stopBtn.click();
+        } else {
+          if (startBtn && !startBtn.disabled) startBtn.click();
+        }
+      });
+    }
+    if (mobileSplice) {
+      mobileSplice.addEventListener('click', () => {
+        if (spliceBtn && !spliceBtn.disabled) spliceBtn.click();
+      });
+    }
+
+    // ── 同步生成按钮状态（running / idle）到一体切换按钮 ──
+    function syncGenerateSlotState() {
+      if (!mobileStart) return;
+      const running = stopBtn && !stopBtn.classList.contains('hidden');
+      // 切换图标
+      const playIcon = mobileStart.querySelector('.mobile-gen-play');
+      const stopIcon = mobileStart.querySelector('.mobile-gen-stop');
+      const label = mobileStart.querySelector('.mobile-gen-label');
+      if (playIcon) playIcon.style.display = running ? 'none' : '';
+      if (stopIcon) stopIcon.style.display = running ? '' : 'none';
+      if (label) label.textContent = running ? '停止' : '开始生成';
+      // 切换样式：running 时改为 outline 风格
+      mobileStart.className = running
+        ? 'geist-button-outline mobile-action-btn gap-2'
+        : 'geist-button mobile-action-btn gap-2';
+      mobileStart.disabled = !running && Boolean(startBtn && startBtn.disabled);
+    }
+
+    if (startBtn || stopBtn) {
+      const syncObserver = new MutationObserver(syncGenerateSlotState);
+      [startBtn, stopBtn].filter(Boolean).forEach((el) => {
+        syncObserver.observe(el, { attributes: true, attributeFilter: ['class', 'disabled'] });
+      });
+    }
+
+    // ── IntersectionObserver：监听 #editPanel 可见性，切换操作插槽 ──
+    const targetPanel = document.getElementById('editPanel');
+    if (targetPanel && 'IntersectionObserver' in window) {
+      let spliceVisible = false;
+      const io = new IntersectionObserver(
+        (entries) => {
+          if (!isMobile()) return;
+          entries.forEach((entry) => { spliceVisible = entry.isIntersecting; });
+          if (slotGenerate) slotGenerate.classList.toggle('mobile-action-slot--active', !spliceVisible);
+          if (slotSplice)   slotSplice.classList.toggle('mobile-action-slot--active', spliceVisible);
+        },
+        { threshold: 0.7 }
+      );
+      io.observe(targetPanel);
+    }
+
+    // ── 延长视频 sticky 按钮文本 & 状态同步 ──
+    function syncSpliceBtnState() {
+      if (!mobileSplice || !spliceBtn) return;
+      mobileSplice.disabled = spliceBtn.disabled;
+      const span = spliceBtn.querySelector('span');
+      const mSpan = mobileSplice.querySelector('span');
+      if (span && mSpan) mSpan.textContent = span.textContent;
+    }
+    if (spliceBtn) {
+      new MutationObserver(syncSpliceBtnState)
+        .observe(spliceBtn, { subtree: true, childList: true, attributes: true, attributeFilter: ['disabled'] });
+    }
+
+    // 初始化状态
+    if (isMobile()) moveCardToBody(); // 移到 body 直接子，确保 position:fixed 相对视口
+    syncGenerateSlotState();
+    syncSpliceBtnState();
+  })();
+
 })();
