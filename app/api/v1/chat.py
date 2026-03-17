@@ -8,6 +8,7 @@ import base64
 import binascii
 import time
 
+import orjson
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -21,6 +22,11 @@ from app.services.token import get_token_manager
 from app.core.config import get_config
 from app.core.exceptions import ValidationException, AppException, ErrorType
 from app.core.logger import logger
+from app.services.grok.utils.response import (
+    make_chat_chunk,
+    make_chat_response,
+    wrap_image_content,
+)
 
 
 class MessageItem(BaseModel):
@@ -40,6 +46,7 @@ class VideoConfig(BaseModel):
     video_length: Optional[int] = Field(6, description="视频时长(秒): 6 / 10 / 15")
     resolution_name: Optional[str] = Field("480p", description="视频分辨率: 480p, 720p")
     preset: Optional[str] = Field("custom", description="风格预设: fun, normal, spicy")
+    single_image_mode: Optional[str] = Field("frame", description="单图模式: frame=作为首帧, reference=作为参考图")
     n: Optional[int] = Field(None, ge=1, le=4, description="生成数量 (1-4，仅非流式)")
     concurrent: Optional[int] = Field(1, ge=1, le=4, description="并发视频数 (1-4，仅非流式)")
 
@@ -273,6 +280,40 @@ def _chat_error_as_success_response(model: str, message: str) -> JSONResponse:
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         },
     )
+
+
+def _build_chat_image_content(images: List[str], response_format: str) -> str:
+    """将图片结果包装为 chat.completions 可消费的 markdown 内容。"""
+    items = [
+        wrap_image_content(str(item or "").strip(), response_format)
+        for item in (images or [])
+        if str(item or "").strip()
+    ]
+    return "\n".join(items)
+
+
+def _build_chat_image_stream(
+    model: str,
+    content: str,
+    usage: Optional[dict] = None,
+):
+    """将最终图片结果包装为 OpenAI 标准 chat chunk 流。"""
+    async def _stream():
+        response_id = f"chatcmpl-{int(time.time() * 1000)}"
+        if content:
+            yield f"data: {orjson.dumps(make_chat_chunk(response_id, model, content)).decode()}\n\n"
+        final_chunk = make_chat_chunk(
+            response_id=response_id,
+            model=model,
+            content="",
+            is_final=True,
+        )
+        if usage is not None:
+            final_chunk["usage"] = usage
+        yield f"data: {orjson.dumps(final_chunk).decode()}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return _stream()
 
 
 def _video_error_message(exc: Exception) -> str:
@@ -676,6 +717,12 @@ def validate_request(request: ChatCompletionRequest):
                 param="video_config.preset",
                 code="invalid_preset",
             )
+        if config.single_image_mode not in ("frame", "reference"):
+            raise ValidationException(
+                message="single_image_mode must be one of ['frame', 'reference']",
+                param="video_config.single_image_mode",
+                code="invalid_single_image_mode",
+            )
         resolved_video_n = None
         if config.n is not None:
             resolved_video_n = config.n
@@ -779,13 +826,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         # image edit 支持最多 3 张参考图
         image_refs = image_urls[:3]
 
-        is_stream = (
+        requested_stream = (
             request.stream if request.stream is not None else get_config("app.stream")
         )
         image_conf = request.image_config or ImageConfig()
-        _validate_image_config(image_conf, stream=bool(is_stream))
+        _validate_image_config(image_conf, stream=bool(requested_stream))
         response_format = _resolve_image_format(image_conf.response_format)
-        response_field = _image_field(response_format)
         n = 1
 
         token_mgr = await get_token_manager()
@@ -813,36 +859,39 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             images=image_refs,
             n=n,
             response_format=response_format,
-            stream=bool(is_stream),
+            stream=False,
         )
 
-        if result.stream:
-            return _build_streaming_response(result.data, raw_request, request.model)
-
-        data = [{response_field: img} for img in result.data]
+        usage = {
+            "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+        }
+        content = _build_chat_image_content(result.data, response_format)
+        if bool(requested_stream):
+            return _build_streaming_response(
+                _build_chat_image_stream(request.model, content, usage),
+                raw_request,
+                request.model,
+            )
         return JSONResponse(
-            content={
-                "created": int(time.time()),
-                "data": data,
-                "usage": {
-                    "total_tokens": 0,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
-                },
-            }
+            content=make_chat_response(
+                model=request.model,
+                content=content,
+                usage=usage,
+            )
         )
 
     if model_info and model_info.is_image:
         prompt, _ = _extract_prompt_images(request.messages)
 
-        is_stream = (
+        requested_stream = (
             request.stream if request.stream is not None else get_config("app.stream")
         )
         image_conf = request.image_config or ImageConfig()
-        _validate_image_config(image_conf, stream=bool(is_stream))
+        _validate_image_config(image_conf, stream=bool(requested_stream))
         response_format = _resolve_image_format(image_conf.response_format)
-        response_field = _image_field(response_format)
         n = image_conf.n or 1
         size = image_conf.size or "1024x1024"
         aspect_ratio_map = {
@@ -880,25 +929,28 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             response_format=response_format,
             size=size,
             aspect_ratio=aspect_ratio,
-            stream=bool(is_stream),
+            stream=False,
         )
 
-        if result.stream:
-            return _build_streaming_response(result.data, raw_request, request.model)
-
-        data = [{response_field: img} for img in result.data]
         usage = result.usage_override or {
             "total_tokens": 0,
             "input_tokens": 0,
             "output_tokens": 0,
             "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
         }
+        content = _build_chat_image_content(result.data, response_format)
+        if bool(requested_stream):
+            return _build_streaming_response(
+                _build_chat_image_stream(request.model, content, usage),
+                raw_request,
+                request.model,
+            )
         return JSONResponse(
-            content={
-                "created": int(time.time()),
-                "data": data,
-                "usage": usage,
-            }
+            content=make_chat_response(
+                model=request.model,
+                content=content,
+                usage=usage,
+            )
         )
 
     if model_info and model_info.is_video:
@@ -916,6 +968,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     video_length=v_conf.video_length,
                     resolution=v_conf.resolution_name,
                     preset=v_conf.preset,
+                    single_image_mode=v_conf.single_image_mode or "frame",
                 )
             else:
                 messages_dump = [msg.model_dump() for msg in request.messages]
@@ -930,6 +983,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         video_length=v_conf.video_length,
                         resolution=v_conf.resolution_name,
                         preset=v_conf.preset,
+                        single_image_mode=v_conf.single_image_mode or "frame",
                     )
                     if not isinstance(single, dict):
                         raise ValidationException(

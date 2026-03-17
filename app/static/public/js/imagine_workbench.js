@@ -159,6 +159,17 @@
     return parentPostId ? buildImaginePublicUrl(parentPostId) : '';
   }
 
+  function isImagePreviewUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return false;
+    if (raw.startsWith('data:image/')) return true;
+    if (/\/imagine-public\/images\/[0-9a-fA-F-]{32,36}(?:\.jpg|\/|$)/i.test(raw)) return true;
+    if (/\/v1\/files\/image\//i.test(raw)) return true;
+    if (/\/users\/.+\.(?:jpg|jpeg|png|webp)(?:[?#].*)?$/i.test(raw)) return true;
+    if (/\.(?:jpg|jpeg|png|webp)(?:[?#].*)?$/i.test(raw)) return true;
+    return false;
+  }
+
   function pickPreviewUrl(hit, parentPostId) {
     const candidates = [
       hit && hit.imageUrl,
@@ -169,7 +180,7 @@
     ];
     for (const candidate of candidates) {
       const raw = String(candidate || '').trim();
-      if (raw) return raw;
+      if (isImagePreviewUrl(raw)) return raw;
     }
     const source = pickSourceImageUrl(hit, parentPostId);
     return source || (parentPostId ? buildImaginePublicUrl(parentPostId) : '');
@@ -1438,15 +1449,23 @@
     if (references.length) {
       body.image_references = references;
       body.reference_items = referenceItems;
-      const firstRef = references[0];
-      if (firstRef.startsWith('data:image/')) {
-        body.image_base64 = firstRef;
-      } else {
-        body.image_url = firstRef;
+      const firstRefItem = referenceItems[0] || null;
+      const firstRef = firstRefItem
+        ? String(firstRefItem.source_image_url || firstRefItem.image_url || '').trim()
+        : '';
+      if (firstRefItem && firstRefItem.parent_post_id) {
+        body.parent_post_id = firstRefItem.parent_post_id;
+        body.source_image_url = String(firstRefItem.source_image_url || firstRef || '').trim();
+      } else if (firstRef) {
+        if (firstRef.startsWith('data:image/')) {
+          body.image_base64 = firstRef;
+        } else {
+          body.image_url = firstRef;
+        }
       }
     }
 
-    if (state.currentParentPostId) {
+    if (state.currentParentPostId && (!body.reference_items || !body.reference_items.length)) {
       body.parent_post_id = state.currentParentPostId;
       if (state.currentSourceImageUrl) {
         body.source_image_url = state.currentSourceImageUrl;

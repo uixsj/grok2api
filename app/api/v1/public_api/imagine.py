@@ -1150,31 +1150,58 @@ async def public_imagine_workbench_edit(data: ImagineWorkbenchEditRequest, reque
             ]
 
         if effective_reference_items:
-            for item in effective_reference_items:
-                ref_parent = _extract_parent_post_id_from_url(str(item.get("parent_post_id") or ""))
-                if ref_parent and not str(item.get("source_image_url") or "").strip():
-                    item["parent_post_id"] = ref_parent
-                    item["source_image_url"] = await _canonicalize_parent_source_image_url(
-                        token,
-                        ref_parent,
-                        str(item.get("image_url") or "").strip(),
-                    )
-                    if not str(item.get("image_url") or "").strip():
-                        item["image_url"] = item["source_image_url"]
-
-            result = await edit_service.edit_with_reference_items(
-                token_mgr=token_mgr,
-                token=token,
-                model_info=model_info,
-                prompt=prompt,
-                reference_items=effective_reference_items,
-                root_parent_post_id=parent_post_id if use_parent_mode else "",
-                response_format="url",
-                stream=False,
-                return_all_images=True,
-                progress_cb=progress_cb,
+            first_ref = effective_reference_items[0] if effective_reference_items else {}
+            only_single_parent_ref = (
+                len(effective_reference_items) == 1
+                and bool(str(first_ref.get("parent_post_id") or "").strip())
             )
-            mode = "parent_post" if use_parent_mode else "upload"
+            if only_single_parent_ref:
+                single_parent_post_id = str(first_ref.get("parent_post_id") or "").strip()
+                single_source_image_url = str(
+                    first_ref.get("source_image_url")
+                    or first_ref.get("image_url")
+                    or current_source_image_url_input
+                    or ""
+                ).strip()
+                result = await edit_service.edit_with_parent_post(
+                    token_mgr=token_mgr,
+                    token=token,
+                    model_info=model_info,
+                    prompt=prompt,
+                    parent_post_id=single_parent_post_id,
+                    source_image_url=single_source_image_url,
+                    response_format="url",
+                    stream=False,
+                    return_all_images=True,
+                    progress_cb=progress_cb,
+                )
+                mode = "parent_post"
+            else:
+                for item in effective_reference_items:
+                    ref_parent = _extract_parent_post_id_from_url(str(item.get("parent_post_id") or ""))
+                    if ref_parent and not str(item.get("source_image_url") or "").strip():
+                        item["parent_post_id"] = ref_parent
+                        item["source_image_url"] = await _canonicalize_parent_source_image_url(
+                            token,
+                            ref_parent,
+                            str(item.get("image_url") or "").strip(),
+                        )
+                        if not str(item.get("image_url") or "").strip():
+                            item["image_url"] = item["source_image_url"]
+
+                result = await edit_service.edit_with_reference_items(
+                    token_mgr=token_mgr,
+                    token=token,
+                    model_info=model_info,
+                    prompt=prompt,
+                    reference_items=effective_reference_items,
+                    root_parent_post_id=parent_post_id if use_parent_mode else "",
+                    response_format="url",
+                    stream=False,
+                    return_all_images=True,
+                    progress_cb=progress_cb,
+                )
+                mode = "parent_post" if use_parent_mode else "upload"
         elif use_parent_mode:
             if current_source_image_url_input and not (
                 current_source_image_url_input.startswith("http://")

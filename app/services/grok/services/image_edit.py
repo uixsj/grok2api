@@ -772,6 +772,7 @@ class ImageEditService:
     ) -> List[dict[str, str]]:
         prepared: List[dict[str, str]] = []
         upload_service = UploadService()
+        primary_parent_consumed = False
         try:
             for item in reference_items:
                 raw_source = str(
@@ -794,13 +795,23 @@ class ImageEditService:
                 attachment_id = ""
                 resolved_url = ""
                 resolved_id = ""
+                current_parent_post_id = str(item.get("parent_post_id") or "").strip()
                 should_upload_for_attachment = _needs_image_edit_reference_upload(
                     item, raw_source
                 )
+                if current_parent_post_id:
+                    if not primary_parent_consumed:
+                        primary_parent_consumed = True
+                        should_upload_for_attachment = False
+                    else:
+                        should_upload_for_attachment = True
                 if not should_upload_for_attachment:
                     normalized_raw = _normalize_asset_url(raw_source)
                     if normalized_raw and not _is_assets_content_url(normalized_raw):
-                        should_upload_for_attachment = True
+                        if current_parent_post_id and primary_parent_consumed:
+                            should_upload_for_attachment = False
+                        else:
+                            should_upload_for_attachment = True
                 if should_upload_for_attachment:
                     file_id, file_uri = await upload_service.upload_file(raw_source, token)
                     resolved_url = _normalize_asset_url(file_uri)
@@ -808,10 +819,7 @@ class ImageEditService:
                         resolved_url
                     )
                     attachment_id = str(file_id or "").strip() or resolved_id
-                    if raw_source.startswith("http://") or raw_source.startswith("https://"):
-                        request_url = raw_source
-                    else:
-                        request_url = resolved_url
+                    request_url = resolved_url
                     mention_id = resolved_id or mention_id
                 else:
                     if raw_source.startswith("/users/") or raw_source.startswith("users/"):
@@ -821,7 +829,7 @@ class ImageEditService:
                     resolved_url = _normalize_asset_url(raw_source)
                     resolved_id = _extract_image_post_id(resolved_url)
                     mention_id = mention_id or resolved_id
-                    attachment_id = resolved_id
+                    attachment_id = ""
                 prepared.append(
                     {
                         "source_url": raw_source,
@@ -831,7 +839,7 @@ class ImageEditService:
                         "resolved_id": resolved_id,
                         "mention_id": mention_id,
                         "attachment_id": attachment_id,
-                        "parent_post_id": str(item.get("parent_post_id") or "").strip(),
+                        "parent_post_id": current_parent_post_id if not should_upload_for_attachment else "",
                         "mention_alias": mention_alias,
                     }
                 )
@@ -917,19 +925,9 @@ class ImageEditService:
                     if str(item.get("request_url") or item.get("resolved_url") or "").strip()
                 ]
                 file_attachments = [
-                    str(
-                        item.get("attachment_id")
-                        or item.get("resolved_id")
-                        or item.get("mention_id")
-                        or ""
-                    ).strip()
+                    str(item.get("attachment_id") or "").strip()
                     for item in prepared_refs
-                    if str(
-                        item.get("attachment_id")
-                        or item.get("resolved_id")
-                        or item.get("mention_id")
-                        or ""
-                    ).strip()
+                    if str(item.get("attachment_id") or "").strip()
                 ]
                 if not request_urls:
                     raise AppException(
@@ -939,17 +937,23 @@ class ImageEditService:
                         status_code=400,
                     )
 
-                effective_parent_post_id = str(root_parent_post_id or "").strip()
-                if not effective_parent_post_id:
-                    first_parent = str(
-                        prepared_refs[0].get("parent_post_id") or ""
-                    ).strip()
-                    if first_parent:
-                        effective_parent_post_id = first_parent
-                if not effective_parent_post_id:
-                    effective_parent_post_id = await VideoService().create_image_post(
-                        current_token, request_urls[0]
-                    )
+                parent_ids = [
+                    str(item.get("parent_post_id") or "").strip()
+                    for item in prepared_refs
+                    if str(item.get("parent_post_id") or "").strip()
+                ]
+                unique_parent_ids = list(dict.fromkeys(parent_ids))
+                effective_parent_post_id = ""
+                # 多张不同 parentPostId 的参考图不能再强行指定单个 parentPostId，
+                # 否则上游会把它视为互相冲突的编辑上下文并直接返回 400。
+                if len(unique_parent_ids) == 1:
+                    effective_parent_post_id = unique_parent_ids[0]
+                elif not unique_parent_ids:
+                    effective_parent_post_id = str(root_parent_post_id or "").strip()
+                    if not effective_parent_post_id:
+                        effective_parent_post_id = await VideoService().create_image_post(
+                            current_token, request_urls[0]
+                        )
 
                 await self._emit_progress(
                     progress_cb, "chat_request_start", 42, "已提交编辑请求"
@@ -960,10 +964,13 @@ class ImageEditService:
                         "imageEditModel": "imagine",
                         "imageEditModelConfig": {
                             "imageReferences": request_urls,
-                            "parentPostId": effective_parent_post_id,
                         },
                     }
                 }
+                if effective_parent_post_id:
+                    model_config_override["modelMap"]["imageEditModelConfig"][
+                        "parentPostId"
+                    ] = effective_parent_post_id
                 _log_final_image_edit_payload(
                     prompt_text=prompt_text,
                     file_attachments=file_attachments,

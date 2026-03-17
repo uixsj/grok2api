@@ -70,14 +70,28 @@
     return raw;
   }
 
+  function isImageLikeUrl(value) {
+    const raw = normalizeUrl(value);
+    if (!raw) return false;
+    if (raw.startsWith('data:image/')) return true;
+    if (/\/imagine-public\/images\/[0-9a-fA-F-]{32,36}(?:\.[a-z0-9]+|[/?#]|$)/i.test(raw)) return true;
+    if (/\/imagine-public\/share-images\/[0-9a-fA-F-]{32,36}(?:\.[a-z0-9]+|[/?#]|$)/i.test(raw)) return true;
+    if (/\/v1\/files\/image\//i.test(raw)) return true;
+    if (/\/users\/.+\.(?:jpg|jpeg|png|webp|gif)(?:[?#].*)?$/i.test(raw)) return true;
+    if (/\.(?:jpg|jpeg|png|webp|gif)(?:[?#].*)?$/i.test(raw)) return true;
+    return false;
+  }
+
   function remember(entry) {
     if (!entry || typeof entry !== 'object') return null;
 
     const parentPostId = extractParentPostId(entry.parentPostId || entry.parent_post_id || entry.id || '');
     if (!isParentPostId(parentPostId)) return null;
 
-    const sourceImageUrl = normalizeUrl(entry.sourceImageUrl || entry.source_image_url || '');
-    const imageUrl = normalizeUrl(entry.imageUrl || entry.image_url || entry.url || '');
+    const rawSourceImageUrl = normalizeUrl(entry.sourceImageUrl || entry.source_image_url || '');
+    const rawImageUrl = normalizeUrl(entry.imageUrl || entry.image_url || entry.url || '');
+    const sourceImageUrl = isImageLikeUrl(rawSourceImageUrl) ? rawSourceImageUrl : '';
+    const imageUrl = isImageLikeUrl(rawImageUrl) ? rawImageUrl : '';
     const item = {
       parentPostId,
       sourceImageUrl: sourceImageUrl || imageUrl || buildImaginePublicUrl(parentPostId),
@@ -114,8 +128,7 @@
     if (!parentPostId) return null;
     const hit = getByParentPostId(parentPostId);
     if (hit) return hit;
-    const looksLikeUrl = raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('/');
-    const fallbackUrl = looksLikeUrl ? raw : buildImaginePublicUrl(parentPostId);
+    const fallbackUrl = isImageLikeUrl(raw) ? raw : buildImaginePublicUrl(parentPostId);
     return {
       parentPostId,
       sourceImageUrl: fallbackUrl,

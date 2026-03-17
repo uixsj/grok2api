@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Union
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -195,6 +195,40 @@ def resolve_aspect_ratio(size: str) -> str:
     return SIZE_TO_ASPECT.get(size) or "2:3"
 
 
+def _should_force_non_streaming(raw_request: Request) -> bool:
+    """
+    对 OpenAI 兼容图片接口默认降级为非流式 JSON。
+
+    当前图片流使用的是自定义 `image_generation.partial_image/completed` 事件，
+    不符合 OpenAI 标准 chunk 结构。像 Cherry Studio 这类客户端会把每个 SSE
+    `data:` 块按 `choices/error` 结构校验，因此会触发 TypeValidationError。
+
+    为保证兼容性，这两个 OpenAI 风格 endpoint 默认忽略 `stream=true`。
+    只有显式传入私有请求头 `X-Grok2API-Image-Stream: 1` 时，才启用旧的自定义 SSE。
+    """
+    stream_opt_in = str(
+        raw_request.headers.get("x-grok2api-image-stream") or ""
+    ).strip().lower()
+    return stream_opt_in not in {"1", "true", "yes", "on"}
+
+
+def _normalize_openai_image_stream_flag(
+    stream_value: Optional[bool], raw_request: Request, route_name: str
+) -> bool:
+    """
+    OpenAI 兼容图片接口默认关闭自定义 SSE。
+
+    这些 endpoint 对外声明为 OpenAI 风格，但当前流式事件不是 OpenAI 标准 chunk。
+    因此默认统一降级为非流式 JSON，只给明确 opt-in 的自有前端保留旧行为。
+    """
+    if not bool(stream_value):
+        return False
+    if _should_force_non_streaming(raw_request):
+        logger.info(f"{route_name} fallback to non-streaming JSON")
+        return False
+    return True
+
+
 def validate_edit_request(request: ImageEditRequest, images: List[UploadFile]):
     """验证图片编辑请求参数"""
     if request.model != "grok-imagine-1.0-edit":
@@ -258,7 +292,7 @@ async def _get_token(model: str):
 
 
 @router.post("/images/generations")
-async def create_image(request: ImageGenerationRequest):
+async def create_image(request: ImageGenerationRequest, raw_request: Request):
     """
     Image Generation API
 
@@ -270,9 +304,9 @@ async def create_image(request: ImageGenerationRequest):
     - {"created": ..., "data": [{"b64_json": "..."}], "usage": {...}}
     """
     try:
-        # stream 默认为 false
-        if request.stream is None:
-            request.stream = False
+        request.stream = _normalize_openai_image_stream_flag(
+            request.stream, raw_request, "Images API"
+        )
 
         if request.response_format is None:
             request.response_format = resolve_response_format(None)
@@ -342,6 +376,7 @@ async def create_image(request: ImageGenerationRequest):
 
 @router.post("/images/edits")
 async def edit_image(
+    raw_request: Request,
     prompt: str = Form(...),
     image: Optional[List[UploadFile]] = File(None),
     image_bracket: Optional[List[UploadFile]] = File(None, alias="image[]"),
@@ -387,8 +422,9 @@ async def edit_image(
                 raise ValidationException(message=msg, param=param, code=code)
             raise ValidationException(message="Invalid request", code="invalid_value")
 
-        if edit_request.stream is None:
-            edit_request.stream = False
+        edit_request.stream = _normalize_openai_image_stream_flag(
+            edit_request.stream, raw_request, "Image edits"
+        )
 
         # 兼容两种多文件字段：image / image[]
         upload_images: List[UploadFile] = []
