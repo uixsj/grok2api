@@ -72,6 +72,7 @@
       justify-content: space-between;
       gap: 12px;
       padding: 8px 4px;
+      margin-bottom: 4px;
     }
 
     /* Elegant Badges */
@@ -176,10 +177,98 @@
     }
 
     #batch-actions {
-      background: rgba(255, 255, 255, 0.92);
-      border: 1px solid var(--border);
-      backdrop-filter: blur(10px);
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+      display: none;
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: fit-content;
+      max-width: 95%;
+      background: rgba(255, 255, 255, 0.85);
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      border-radius: 20px;
+      padding: 10px 16px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15), 
+                  0 0 0 1px rgba(0, 0, 0, 0.05);
+      z-index: 100;
+      transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    #batch-actions.show-actions {
+      display: flex;
+      animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+
+    @keyframes slideUp {
+      from { transform: translate(-50%, 30px); opacity: 0; }
+      to { transform: translate(-50%, 0); opacity: 1; }
+    }
+
+    @media (max-width: 900px) {
+      main {
+        padding-bottom: 160px !important; 
+      }
+
+      #batch-actions.show-actions {
+        display: flex;
+        position: fixed;
+        bottom: 24px;
+        left: 16px;
+        right: 16px;
+        width: auto;
+        transform: translateY(0); /* 移动端覆盖居中定位 */
+        border-radius: 24px;
+        padding: 14px;
+        flex-direction: column;
+        background: rgba(255, 255, 255, 0.95);
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        animation: slideUpMobile 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+      }
+
+      @keyframes slideUpMobile {
+        from { transform: translateY(30px); opacity: 0; }
+        to { transform: translateY(0); opacity: 1; }
+      }
+
+      #batch-actions .text-sm.font-medium {
+        justify-content: center;
+        padding-bottom: 12px;
+        margin-bottom: 10px;
+        border-bottom: 1px dashed var(--border);
+        letter-spacing: 0.02em;
+      }
+
+      #batch-actions #selected-count {
+        background: #000;
+        color: #fff;
+        padding: 2px 8px;
+        font-weight: 600;
+      }
+
+      #batch-actions .batch-action-buttons {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+      }
+
+      #batch-actions .batch-action-buttons .geist-button-outline,
+      #batch-actions .batch-action-buttons .geist-button-danger {
+        height: 42px;
+        border-radius: 12px;
+        font-size: 13px;
+        font-weight: 500;
+        background: rgba(255, 255, 255, 0.5);
+        border: 1px solid rgba(0, 0, 0, 0.05);
+        box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+      }
+
+      #batch-actions .batch-action-buttons .geist-button-danger {
+        background: #ff4d4f;
+        color: white;
+        border: none;
+      }
     }
 
     #batch-actions .geist-button-outline:hover {
@@ -411,30 +500,38 @@
     }
 
     @media (max-width: 900px) {
-      .pagination-bar {
-        flex-direction: column;
-        align-items: stretch;
+      main {
+        padding-bottom: 5rem; /* 为底部浮窗留出空间 */
       }
 
-      .pagination-bar > div {
-        width: 100%;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
+      .pagination-bar {
+        display: block;
+        padding: 4px;
       }
 
       .pagination-bar #pagination-info {
-        justify-content: flex-start;
+        margin-bottom: 8px;
+        font-size: 11px;
       }
 
-      .pagination-bar .geist-button-outline,
-      .pagination-bar .geist-button {
-        flex: 1;
-        min-width: 110px;
+      .pagination-bar .flex.items-center.gap-2 {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+
+      .pagination-bar .geist-button-outline {
+        padding: 0 8px;
+        height: 28px;
+        font-size: 11px;
+        flex: 1 1 auto;
+        min-width: calc(33.33% - 4px);
       }
 
       #page-size {
         width: 100%;
+        height: 28px;
+        font-size: 11px;
       }
 
       #batch-actions {
@@ -442,33 +539,38 @@
         right: 12px;
         bottom: 12px;
         transform: none;
-        border-radius: 14px;
-        padding: 10px;
-        white-space: normal;
-        gap: 8px;
+        width: auto;
+        max-width: none;
+        border-radius: 12px;
+        padding: 4px 8px;
+        gap: 4px;
+        flex-direction: column;
+        align-items: stretch;
       }
 
       #batch-actions .toolbar-sep {
         display: none;
       }
 
+      #batch-actions .text-sm.font-medium {
+        padding: 4px 0;
+        border-bottom: 1px solid var(--border);
+        margin-bottom: 4px;
+      }
+
       #batch-actions .batch-action-buttons {
-        width: 100%;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 4px;
       }
 
       #batch-actions .batch-action-buttons .geist-button-outline,
       #batch-actions .batch-action-buttons .geist-button-danger {
-        flex: 1;
-        min-width: 110px;
-        justify-content: center;
-      }
-
-      #batch-actions #batch-progress {
         width: 100%;
-        flex-wrap: wrap;
+        height: 32px;
+        padding: 0;
+        font-size: 11px;
+        justify-content: center;
       }
 
       .modal-content {
