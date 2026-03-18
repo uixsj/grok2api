@@ -417,8 +417,8 @@ body > .video-settings-card > .card-title {
 }
 
 .history-panel .video-item-actions .geist-button-outline {
-  color: var(--accents-7);
-  border-color: var(--video-outline);
+  color: #fff;
+  border-color: #fff;
 }
 
 .history-panel .video-item-actions {
