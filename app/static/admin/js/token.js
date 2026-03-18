@@ -382,6 +382,16 @@ function updateSelectionState() {
   }
   const selectedCountEl = byId('selected-count');
   if (selectedCountEl) selectedCountEl.innerText = selectedCount;
+  
+  const batchActions = byId('batch-actions');
+  if (batchActions) {
+    if (selectedCount > 0) {
+      batchActions.classList.add('show-actions');
+    } else {
+      batchActions.classList.remove('show-actions');
+    }
+  }
+  
   setActionButtonsState(selectedCount);
 }
 

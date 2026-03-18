@@ -243,8 +243,9 @@ class MediaPostReverse:
                     if len(content) > 300:
                         content = f"{content[:300]}...(len={len(content)})"
                     logger.error(
-                        "MediaPostReverse: Media post create failed, "
-                        f"status={response.status_code}, body={content or '-'}",
+                        "MediaPostReverse: Media post create failed, status={}, body={}",
+                        response.status_code,
+                        content or '-',
                         extra={"error_type": "UpstreamException"},
                     )
                     raise UpstreamException(
@@ -342,8 +343,9 @@ class MediaPostReverse:
                     if len(content) > 300:
                         content = f"{content[:300]}...(len={len(content)})"
                     logger.error(
-                        "MediaPostReverse: Media post get failed, "
-                        f"status={response.status_code}, body={content or '-'}",
+                        "MediaPostReverse: Media post get failed, status={}, body={}",
+                        response.status_code,
+                        content or '-',
                         extra={"error_type": "UpstreamException"},
                     )
                     raise UpstreamException(
@@ -442,8 +444,9 @@ class MediaPostReverse:
                     if len(content) > 300:
                         content = f"{content[:300]}...(len={len(content)})"
                     logger.error(
-                        "MediaPostReverse: Media post create-link failed, "
-                        f"status={response.status_code}, body={content or '-'}",
+                        "MediaPostReverse: Media post create-link failed, status={}, body={}",
+                        response.status_code,
+                        content or '-',
                         extra={"error_type": "UpstreamException"},
                     )
                     raise UpstreamException(
