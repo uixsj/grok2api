@@ -429,6 +429,10 @@ body {
   padding-right: 0;
 }
 
+.think-image-extract {
+  margin: 12px 0 16px;
+}
+
 .img-grid {
   display: grid;
   gap: 2px;

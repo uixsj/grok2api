@@ -551,9 +551,8 @@ class StreamProcessor(proc_base.BaseProcessor):
         self.rollout_id: str = ""
         self.fingerprint: str = ""
         self.think_opened: bool = False
-        self.seen_think_once: bool = False
+        self.think_closed_once: bool = False
         self.image_think_active: bool = False
-        self.answer_buffer: list[str] = []
         self.role_sent: bool = False
         self.filter_tags = get_config("app.filter_tags")
         self.tool_usage_enabled = (
@@ -758,6 +757,13 @@ class StreamProcessor(proc_base.BaseProcessor):
         }
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
 
+    async def _close_think_block(self) -> AsyncGenerator[str, None]:
+        """Close the visible think block before emitting normal answer content."""
+        if self.think_opened:
+            yield self._sse("\n</think>\n")
+            self.think_opened = False
+            self.think_closed_once = True
+
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """Process stream response.
         
@@ -805,7 +811,6 @@ class StreamProcessor(proc_base.BaseProcessor):
                     if not self.think_opened:
                         yield self._sse("<think>\n")
                         self.think_opened = True
-                    self.seen_think_once = True
                     idx = img.get("imageIndex", 0) + 1
                     progress = img.get("progress", 0)
                     yield self._sse(
@@ -814,6 +819,9 @@ class StreamProcessor(proc_base.BaseProcessor):
                     continue
 
                 if mr := resp.get("modelResponse"):
+                    if self.image_think_active and self.think_opened:
+                        async for chunk in self._close_think_block():
+                            yield chunk
                     self.image_think_active = False
                     for url in proc_base._collect_images(mr):
                         parts = url.split("/")
@@ -844,6 +852,8 @@ class StreamProcessor(proc_base.BaseProcessor):
                             original = image.get("original")
                             title = image.get("title") or ""
                             if original:
+                                async for chunk in self._close_think_block():
+                                    yield chunk
                                 title_safe = title.replace("\n", " ").strip()
                                 if title_safe:
                                     yield self._sse(f"![{title_safe}]({original})\n")
@@ -854,6 +864,8 @@ class StreamProcessor(proc_base.BaseProcessor):
                 if (token := resp.get("token")) is not None:
                     if not token:
                         continue
+                    if is_thinking and self.think_closed_once and not self.image_think_active:
+                        continue
                     filtered = self._filter_token(token)
                     if not filtered:
                         continue
@@ -862,7 +874,7 @@ class StreamProcessor(proc_base.BaseProcessor):
                     if not filtered:
                         continue
                     in_think = (
-                        is_thinking
+                        (is_thinking and not self.think_closed_once)
                         or self.image_think_active
                     )
                     if in_think:
@@ -871,14 +883,11 @@ class StreamProcessor(proc_base.BaseProcessor):
                         if not self.think_opened:
                             yield self._sse("<think>\n")
                             self.think_opened = True
-                        self.seen_think_once = True
                         yield self._sse(filtered)
                         continue
-
-                    # 一旦进入思考模式，先缓存正文，等思考结束后再统一输出
-                    if self.show_think and self.seen_think_once:
-                        self.answer_buffer.append(filtered)
-                        continue
+                    if self.think_opened:
+                        async for chunk in self._close_think_block():
+                            yield chunk
 
                     if self._tool_stream_enabled:
                         for kind, payload in self._handle_tool_stream(filtered):
@@ -891,25 +900,9 @@ class StreamProcessor(proc_base.BaseProcessor):
                     yield self._sse(filtered)
 
             if self.think_opened:
-                yield self._sse("</think>\n")
-                self.think_opened = False
-            if self.answer_buffer:
-                buffered = "".join(self.answer_buffer)
-                if self._tool_stream_enabled:
-                    for kind, payload in self._handle_tool_stream(buffered):
-                        if kind == "text":
-                            yield self._sse(payload)
-                        elif kind == "tool":
-                            yield self._sse(tool_calls=[payload])
-                    for kind, payload in self._flush_tool_stream():
-                        if kind == "text":
-                            yield self._sse(payload)
-                        elif kind == "tool":
-                            yield self._sse(tool_calls=[payload])
-                else:
-                    yield self._sse(buffered)
-                self.answer_buffer = []
-            if self._tool_stream_enabled and not self.answer_buffer:
+                async for chunk in self._close_think_block():
+                    yield chunk
+            if self._tool_stream_enabled:
                 for kind, payload in self._flush_tool_stream():
                     if kind == "text":
                         yield self._sse(payload)

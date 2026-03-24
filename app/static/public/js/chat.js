@@ -1109,6 +1109,44 @@
     });
   }
 
+  function liftThinkImages(root) {
+    if (!root || !root.querySelectorAll) return;
+    const thinkBlocks = Array.from(root.querySelectorAll('.think-block'));
+    thinkBlocks.forEach((block, blockIndex) => {
+      const images = Array.from(block.querySelectorAll('.think-content img'));
+      if (!images.length) return;
+
+      let gallery = block.nextElementSibling;
+      if (!(gallery instanceof HTMLElement) || !gallery.classList.contains('think-image-extract')) {
+        gallery = document.createElement('div');
+        gallery.className = 'think-image-extract';
+        gallery.dataset.thinkBlockIndex = String(blockIndex);
+        block.insertAdjacentElement('afterend', gallery);
+      }
+
+      images.forEach((img) => {
+        const paragraph = img.closest('p');
+        gallery.appendChild(img);
+
+        if (paragraph) {
+          const residue = (paragraph.textContent || '').replace(/\s+/g, '');
+          if (!residue || /^\.(?:png|jpe?g|webp|gif)\)?$/i.test(residue)) {
+            paragraph.remove();
+            return;
+          }
+        }
+
+        const nextText = img.nextSibling;
+        if (nextText && nextText.nodeType === Node.TEXT_NODE) {
+          nextText.textContent = String(nextText.textContent || '').replace(/^\s*\.(?:png|jpe?g|webp|gif)\)?/i, '');
+          if (!nextText.textContent.trim()) {
+            nextText.parentNode && nextText.parentNode.removeChild(nextText);
+          }
+        }
+      });
+    });
+  }
+
   function bindCodeCopyButtons(root) {
     if (!root || !root.querySelectorAll) return;
     const buttons = root.querySelectorAll('.code-copy-btn');
@@ -1216,6 +1254,7 @@
       updateThinkSummary(entry, entry.thinkElapsed);
     }
     if (entry.role === 'assistant' || entry.role === 'user') {
+      liftThinkImages(entry.contentNode);
       applyImageGrid(entry.contentNode);
       enhanceBrokenImages(entry.contentNode);
       bindMessageImagePreview(entry.contentNode);
