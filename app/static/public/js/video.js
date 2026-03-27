@@ -151,6 +151,37 @@
     }
   }
 
+  function normalizeUploadErrorMessage(message) {
+    const text = String(message || '').trim();
+    if (!text) return text;
+    if (/content_moderated|content[- ]moderated|content is moderated/i.test(text)) {
+      return '图片内容触发审核限制，无法上传。请更换图片后重试。';
+    }
+    return text;
+  }
+
+  async function parseApiErrorText(res, fallbackText) {
+    const text = await res.text();
+    if (!text) return fallbackText || `请求失败：HTTP ${res.status}`;
+    try {
+      const data = JSON.parse(text);
+      if (data && typeof data === 'object') {
+        if (data.error && data.error.message) {
+          return normalizeUploadErrorMessage(String(data.error.message));
+        }
+        if (data.detail) {
+          return normalizeUploadErrorMessage(String(data.detail));
+        }
+        if (data.message) {
+          return normalizeUploadErrorMessage(String(data.message));
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+    return normalizeUploadErrorMessage(text || fallbackText);
+  }
+
   function ensureRenameDialog() {
     let overlay = document.getElementById('videoRenameDialog');
     if (overlay) return overlay;
@@ -593,13 +624,16 @@
     if (!spliceBtn) return;
     const iconExtend = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>';
     const iconStop = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14"/></svg>';
+    spliceBtn.classList.remove('is-running', 'is-stopping');
     if (state === 'running') {
       spliceBtn.disabled = false;
+      spliceBtn.classList.add('is-running');
       spliceBtn.innerHTML = `${iconStop}<span>中止延长</span>`;
       return;
     }
     if (state === 'stopping') {
       spliceBtn.disabled = true;
+      spliceBtn.classList.add('is-stopping');
       spliceBtn.innerHTML = `${iconStop}<span>中止中...</span>`;
       return;
     }
@@ -1852,8 +1886,7 @@
       })
     });
     if (!res.ok) {
-      const text = await res.text();
-      throw new Error(text || 'Failed to create task');
+      throw new Error(await parseApiErrorText(res, 'Failed to create task'));
     }
     const data = await res.json();
     if (data && Array.isArray(data.task_ids) && data.task_ids.length > 0) {
@@ -2564,8 +2597,7 @@
       })
     });
     if (!res.ok) {
-      const text = await res.text();
-      throw new Error(text || 'create_edit_task_failed');
+      throw new Error(await parseApiErrorText(res, 'create_edit_task_failed'));
     }
     const data = await res.json();
     if (data && Array.isArray(data.task_ids) && data.task_ids.length > 0) {
@@ -2744,7 +2776,7 @@
         body: JSON.stringify(body),
       });
       if (!resp.ok) {
-        const errText = await resp.text();
+        const errText = await parseApiErrorText(resp, '');
         throw new Error(`延长请求失败: ${resp.status} ${errText}`);
       }
       const result = await resp.json();
@@ -3815,9 +3847,8 @@
       if (playIcon) playIcon.style.display = running ? 'none' : '';
       if (stopIcon) stopIcon.style.display = running ? '' : 'none';
       if (label) label.textContent = running ? '停止' : '开始生成';
-      // 切换样式：running 时改为 outline 风格
       mobileStart.className = running
-        ? 'geist-button-outline mobile-action-btn gap-2'
+        ? 'geist-button mobile-action-btn gap-2 is-stop'
         : 'geist-button mobile-action-btn gap-2';
       mobileStart.disabled = !running && Boolean(startBtn && startBtn.disabled);
     }
@@ -3849,9 +3880,9 @@
     function syncSpliceBtnState() {
       if (!mobileSplice || !spliceBtn) return;
       mobileSplice.disabled = spliceBtn.disabled;
-      const span = spliceBtn.querySelector('span');
-      const mSpan = mobileSplice.querySelector('span');
-      if (span && mSpan) mSpan.textContent = span.textContent;
+      mobileSplice.classList.toggle('is-running', spliceBtn.classList.contains('is-running'));
+      mobileSplice.classList.toggle('is-stopping', spliceBtn.classList.contains('is-stopping'));
+      mobileSplice.innerHTML = spliceBtn.innerHTML;
     }
     if (spliceBtn) {
       new MutationObserver(syncSpliceBtnState)

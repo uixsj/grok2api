@@ -1,4 +1,4 @@
-﻿(() => {
+(() => {
   const modelSelect = document.getElementById('modelSelect');
   const modelPicker = document.getElementById('modelPicker');
   const modelPickerBtn = document.getElementById('modelPickerBtn');
@@ -81,12 +81,6 @@
 
   function serializeMessage(msg) {
     if (!msg || typeof msg !== 'object') return msg;
-    if (Array.isArray(msg.content)) {
-      return {
-        ...msg,
-        content: getMessageDisplay(msg)
-      };
-    }
     return msg;
   }
 
@@ -143,7 +137,17 @@
         entry.rendering = msg.rendering || null;
         updateMessage(entry, text, true);
       } else if (entry && msg.role === 'user') {
-        renderUserMessage(entry, text, []);
+        let msgAttachments = [];
+        if (Array.isArray(msg.content)) {
+            msgAttachments = msg.content
+                .filter(b => b && (b.type === 'image_url' || b.type === 'file'))
+                .map(b => {
+                    if (b.type === 'image_url' && b.image_url) return { mime: 'image/jpeg', name: 'image', data: b.image_url.url };
+                    if (b.type === 'file') return { mime: b.mime || '', name: b.name || 'file', data: b.data || b.url };
+                    return null;
+                }).filter(Boolean);
+        }
+        renderUserMessage(entry, text, msgAttachments);
       }
     }
     if (activeStreamInfo && activeStreamInfo.sessionId === session.id && activeStreamInfo.entry.row) {
@@ -423,6 +427,46 @@
     }
   }
 
+  async function parseApiError(res) {
+    let text = '';
+    try {
+      text = await res.text();
+    } catch (e) {
+      text = '';
+    }
+
+    let message = `请求失败: ${res.status}`;
+    let code = '';
+    let param = '';
+    if (text) {
+      try {
+        const data = JSON.parse(text);
+        const err = data && typeof data === 'object' && data.error ? data.error : data;
+        if (err && typeof err === 'object') {
+          message = String(err.message || message);
+          code = String(err.code || '');
+          param = String(err.param || '');
+        } else if (typeof data === 'string' && data.trim()) {
+          message = data.trim();
+        }
+      } catch (e) {
+        const plain = text.trim();
+        if (plain) message = plain;
+      }
+    }
+
+    if (code === 'content_moderated' || /content[- ]moderated/i.test(message)) {
+      message = '图片内容触发审核限制，无法上传。请更换图片后重试。';
+    }
+
+    const err = new Error(message);
+    err.status = res.status;
+    err.code = code;
+    err.param = param;
+    err.raw = text;
+    return err;
+  }
+
   function setStatus(state, text) {
     if (!statusText) return;
     statusText.textContent = text || '就绪';
@@ -654,11 +698,181 @@
   }
 
   function buildRenderedImageMarkdown(card) {
-    const image = card && card.image && typeof card.image === 'object' ? card.image : {};
-    const original = String(image.original || image.link || '').trim();
+    let image = card && card.image && typeof card.image === 'object' ? card.image : null;
+    let original = image ? String(image.original || image.link || '').trim() : '';
+    let title = image ? normalizeSourceText(image.title || '') : '';
+    
+    if (!original && card && card.image_chunk) {
+        original = String(card.image_chunk.imageUrl || '').trim();
+        if (!title && card.image_chunk.imageTitle) {
+            title = normalizeSourceText(card.image_chunk.imageTitle || '');
+        }
+    }
+    if (original && !original.startsWith('http')) {
+        let basePath = original.startsWith('/') ? original : '/' + original;
+        original = '/v1/files/image' + basePath;
+    }
+    
     if (!original) return '';
-    const title = normalizeSourceText(image.title || '') || 'image';
-    return `\n![${title}](${original})\n`;
+    return `\n![${title || 'image'}](${original})\n`;
+  }
+
+  function normalizeRenderedImageUrl(url) {
+    const raw = String(url || '').trim();
+    if (!raw) return '';
+    if (raw.startsWith('data:')) {
+      return raw;
+    }
+    if (/^(?:https?:)?\/\//i.test(raw)) {
+      try {
+        const parsed = new URL(raw, window.location.origin);
+        const host = String(parsed.hostname || '').toLowerCase();
+        const path = String(parsed.pathname || '').trim();
+        const marker = '/v1/files/image/';
+
+        if (path.includes(marker)) {
+          return path.slice(path.indexOf(marker));
+        }
+        if (host === 'localhost' || host === '127.0.0.1') {
+          return path || '';
+        }
+        if (host === 'assets.grok.com' && path) {
+          return `/v1/files/image${path.startsWith('/') ? path : `/${path}`}`;
+        }
+        return '';
+      } catch (e) {
+        return '';
+      }
+    }
+    const basePath = raw.startsWith('/') ? raw : `/${raw}`;
+    return basePath.startsWith('/v1/files/image/')
+      ? basePath
+      : `/v1/files/image${basePath}`;
+  }
+
+  function collectRenderedImageUrlsFromCard(card) {
+    const urls = [];
+    if (!card || typeof card !== 'object') return urls;
+    if (card.image && typeof card.image === 'object') {
+      urls.push(card.image.original, card.image.link);
+    }
+    if (card.image_chunk && typeof card.image_chunk === 'object') {
+      urls.push(card.image_chunk.imageUrl);
+    }
+    return urls
+      .map((item) => normalizeRenderedImageUrl(item))
+      .filter(Boolean);
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(reader.error || new Error('读取图片失败'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function inferImageExtension(mime, fallbackUrl) {
+    const normalizedMime = String(mime || '').trim().toLowerCase();
+    if (normalizedMime === 'image/jpeg') return 'jpg';
+    if (normalizedMime === 'image/png') return 'png';
+    if (normalizedMime === 'image/webp') return 'webp';
+    if (normalizedMime === 'image/gif') return 'gif';
+    if (normalizedMime === 'image/svg+xml') return 'svg';
+    const match = String(fallbackUrl || '').match(/\.([a-z0-9]+)(?:[\?#]|$)/i);
+    return match ? String(match[1]).toLowerCase() : 'png';
+  }
+
+  async function buildAssistantImageAttachment(url, index) {
+    const normalizedUrl = normalizeRenderedImageUrl(url);
+    if (!normalizedUrl) return null;
+    try {
+      const res = await fetch(normalizedUrl);
+      if (!res.ok) {
+        throw new Error(`下载图片失败: ${res.status}`);
+      }
+      const blob = await res.blob();
+      const data = await blobToDataUrl(blob);
+      const mime = String(blob.type || '').trim() || 'image/png';
+      const ext = inferImageExtension(mime, normalizedUrl);
+      return {
+        mime,
+        name: `grok-image-${index + 1}.${ext}`,
+        data,
+        source: 'assistant'
+      };
+    } catch (e) {
+      console.warn('自动附加 assistant 图片失败', normalizedUrl, e);
+      return null;
+    }
+  }
+
+  function collectAssistantImageUrls(entry) {
+    const urls = [];
+    const seen = new Set();
+    const pushUrl = (value) => {
+      const normalized = normalizeRenderedImageUrl(value);
+      if (!normalized || seen.has(normalized)) return;
+      seen.add(normalized);
+      urls.push(normalized);
+    };
+
+    if (entry && entry.contentNode && entry.contentNode.querySelectorAll) {
+      const images = entry.contentNode.querySelectorAll('.message-image-card img, .img-grid img');
+      images.forEach((img) => {
+        pushUrl(img.currentSrc || img.getAttribute('src') || '');
+      });
+    }
+
+    if (!urls.length && entry && entry.rendering) {
+      const cardMap = parseRenderingCards(entry.rendering);
+      cardMap.forEach((card) => {
+        const cType = String(card && card.type || '');
+        const cardType = String(card && card.cardType || '');
+        if (
+          cType === 'render_searched_image' ||
+          cType === 'render_edited_image' ||
+          cType === 'render_generated_image' ||
+          cardType === 'generated_image_card'
+        ) {
+          collectRenderedImageUrlsFromCard(card).forEach(pushUrl);
+        }
+      });
+      const extraImages = Array.isArray(entry.rendering.extraImages) ? entry.rendering.extraImages : [];
+      extraImages.forEach(pushUrl);
+    }
+
+    return urls;
+  }
+
+  async function quoteAssistantImages(entry) {
+    if (!entry || entry.role !== 'assistant') {
+      toast('当前消息不可引用', 'error');
+      return;
+    }
+    const urls = collectAssistantImageUrls(entry);
+    if (!urls.length) {
+      toast('当前回答没有可引用的图片', 'error');
+      return;
+    }
+    const results = await Promise.all(urls.map((url, index) => buildAssistantImageAttachment(url, index)));
+    const imageAttachments = results.filter(Boolean);
+    if (!imageAttachments.length) {
+      toast('引用图片失败', 'error');
+      return;
+    }
+    imageAttachments.forEach((item) => {
+      attachments.push({
+        ...item,
+        name: buildUniqueFileName(item.name || 'image')
+      });
+    });
+    showAttachmentBadge();
+    if (promptInput) {
+      promptInput.focus();
+    }
+    toast(`已引用 ${imageAttachments.length} 张图片`, 'success');
   }
 
   function normalizeRenderedMarkdownLayout(text) {
@@ -690,9 +904,11 @@
 
   function renderExactGrokCards(rawMessage, rendering) {
     const message = String(rawMessage || '');
-    if (!message || !rendering || typeof rendering !== 'object') return message;
+    if (!rendering || typeof rendering !== 'object') return message;
     const cardMap = parseRenderingCards(rendering);
-    if (!cardMap.size) return message;
+    const extraImages = Array.isArray(rendering.extraImages) ? rendering.extraImages : [];
+    
+    if (!cardMap.size && !extraImages.length) return message;
 
     let rendered = message.replace(
       /(?:<grok:render\b[^>]*card_id="[^"]+"[^>]*>[\s\S]*?<\/grok:render>(?:\s|&nbsp;|\u00a0|\u2060)*)+/g,
@@ -722,7 +938,9 @@
             return;
           }
           flushCitations();
-          if (String(card.type || '') === 'render_searched_image') {
+          const cType = String(card.type || '');
+          const cardType = String(card.cardType || '');
+          if (cType === 'render_searched_image' || cType === 'render_edited_image' || cType === 'render_generated_image' || cardType === 'generated_image_card') {
             output.push(buildRenderedImageMarkdown(card));
           }
         });
@@ -732,7 +950,6 @@
       }
     );
 
-    const extraImages = Array.isArray(rendering.extraImages) ? rendering.extraImages : [];
     if (extraImages.length) {
       const appended = extraImages
         .map((url) => String(url || '').trim())
@@ -762,8 +979,7 @@
       : null;
     const rawMessage = rawModelResponse && typeof rawModelResponse.message === 'string'
       ? rawModelResponse.message
-      : '';
-    if (!rawMessage) return entry.raw || '';
+      : (entry.raw || '');
     const renderedAnswer = renderExactGrokCards(rawMessage, rendering);
     const thinkMarkup = extractThinkMarkup(entry.raw || '');
     if (!thinkMarkup) return renderedAnswer;
@@ -2386,6 +2602,7 @@
 
     const retryBtn = createActionButton('重试', '重试上一条回答', () => retryLast());
     const copyBtn = createActionButton('复制', '复制回答内容', () => copyToClipboard(entry.raw || ''));
+    const quoteBtn = createActionButton('引用', '把这条回答里的图片加入附件', () => quoteAssistantImages(entry));
     const feedbackBtn = createActionButton('反馈', '反馈到 Grok2API', () => {
       window.open(feedbackUrl, '_blank', 'noopener');
     });
@@ -2393,6 +2610,7 @@
     if (sourcesWidget) actions.appendChild(sourcesWidget);
     actions.appendChild(retryBtn);
     actions.appendChild(copyBtn);
+    actions.appendChild(quoteBtn);
     actions.appendChild(feedbackBtn);
     entry.row.appendChild(actions);
   }
@@ -2463,7 +2681,7 @@
       });
 
       if (!res.ok) {
-        throw new Error(`请求失败: ${res.status}`);
+        throw await parseApiError(res);
       }
 
       await handleStream(res, assistantEntry, retrySessionId);
@@ -2483,7 +2701,7 @@
       } else {
         updateMessage(assistantEntry, `请求失败: ${e.message || e}`, true);
         setStatus('error', '失败');
-        toast('请求失败，请检查服务状态', 'error');
+        toast(e.message || '请求失败，请检查服务状态', 'error');
       }
     } finally {
       setSendingState(false);
@@ -2511,7 +2729,12 @@
         blocks.push({ type: 'text', text: prompt });
       }
       attachments.forEach((item) => {
-        blocks.push({ type: 'file', file: { file_data: item.data } });
+        const isImage = String(item.mime || '').startsWith('image/');
+        if (isImage) {
+          blocks.push({ type: 'image_url', image_url: { url: item.data } });
+        } else {
+          blocks.push({ type: 'file', file: { file_data: item.data } });
+        }
       });
       content = blocks;
     }
@@ -2553,7 +2776,7 @@
       });
 
       if (!res.ok) {
-        throw new Error(`请求失败: ${res.status}`);
+        throw await parseApiError(res);
       }
 
       await handleStream(res, assistantEntry, sendSessionId);
@@ -2577,7 +2800,7 @@
       } else {
         updateMessage(assistantEntry, `请求失败: ${e.message || e}`, true);
         setStatus('error', '失败');
-        toast('请求失败，请检查服务状态', 'error');
+        toast(e.message || '请求失败，请检查服务状态', 'error');
       }
     } finally {
       setSendingState(false);

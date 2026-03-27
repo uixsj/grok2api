@@ -1078,14 +1078,24 @@ class StreamProcessor(proc_base.BaseProcessor):
                             image = card_data.get("image") or {}
                             original = image.get("original")
                             title = image.get("title") or ""
+                            if not original and "image_chunk" in card_data:
+                                original = card_data["image_chunk"].get("imageUrl")
+                                if not title:
+                                    title = card_data["image_chunk"].get("imageTitle") or "Generated Image"
                             if original:
                                 async for chunk in self._close_think_block():
                                     yield chunk
                                 title_safe = title.replace("\n", " ").strip()
-                                if title_safe:
-                                    yield self._sse(f"![{title_safe}]({original})\n")
+                                dl_service = getattr(self, "_get_dl", lambda: None)()
+                                if dl_service:
+                                    img_id = title_safe if title_safe else "image"
+                                    rendered = await dl_service.render_image(original, self.token, img_id)
+                                    yield self._sse(f"{rendered}\n")
                                 else:
-                                    yield self._sse(f"![image]({original})\n")
+                                    if not original.startswith("http"):
+                                        original = f"https://assets.grok.com/{original.lstrip('/')}"
+                                    img_id = title_safe if title_safe else "image"
+                                    yield self._sse(f"![{img_id}]({original})\n")
                     continue
 
                 if tool_card := resp.get("toolUsageCard"):
