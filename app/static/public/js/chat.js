@@ -427,6 +427,46 @@
     }
   }
 
+  async function parseApiError(res) {
+    let text = '';
+    try {
+      text = await res.text();
+    } catch (e) {
+      text = '';
+    }
+
+    let message = `请求失败: ${res.status}`;
+    let code = '';
+    let param = '';
+    if (text) {
+      try {
+        const data = JSON.parse(text);
+        const err = data && typeof data === 'object' && data.error ? data.error : data;
+        if (err && typeof err === 'object') {
+          message = String(err.message || message);
+          code = String(err.code || '');
+          param = String(err.param || '');
+        } else if (typeof data === 'string' && data.trim()) {
+          message = data.trim();
+        }
+      } catch (e) {
+        const plain = text.trim();
+        if (plain) message = plain;
+      }
+    }
+
+    if (code === 'content_moderated' || /content[- ]moderated/i.test(message)) {
+      message = '图片内容触发审核限制，无法上传。请更换图片后重试。';
+    }
+
+    const err = new Error(message);
+    err.status = res.status;
+    err.code = code;
+    err.param = param;
+    err.raw = text;
+    return err;
+  }
+
   function setStatus(state, text) {
     if (!statusText) return;
     statusText.textContent = text || '就绪';
@@ -2641,7 +2681,7 @@
       });
 
       if (!res.ok) {
-        throw new Error(`请求失败: ${res.status}`);
+        throw await parseApiError(res);
       }
 
       await handleStream(res, assistantEntry, retrySessionId);
@@ -2661,7 +2701,7 @@
       } else {
         updateMessage(assistantEntry, `请求失败: ${e.message || e}`, true);
         setStatus('error', '失败');
-        toast('请求失败，请检查服务状态', 'error');
+        toast(e.message || '请求失败，请检查服务状态', 'error');
       }
     } finally {
       setSendingState(false);
@@ -2736,7 +2776,7 @@
       });
 
       if (!res.ok) {
-        throw new Error(`请求失败: ${res.status}`);
+        throw await parseApiError(res);
       }
 
       await handleStream(res, assistantEntry, sendSessionId);
@@ -2760,7 +2800,7 @@
       } else {
         updateMessage(assistantEntry, `请求失败: ${e.message || e}`, true);
         setStatus('error', '失败');
-        toast('请求失败，请检查服务状态', 'error');
+        toast(e.message || '请求失败，请检查服务状态', 'error');
       }
     } finally {
       setSendingState(false);
