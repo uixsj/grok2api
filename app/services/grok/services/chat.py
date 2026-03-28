@@ -343,10 +343,13 @@ def _build_capture_event(resp: Dict[str, Any], model: str, phase: str, seq: int)
 
 
 def _capture_app_chat_event(resp: Dict[str, Any], model: str, phase: str, seq: int) -> None:
-    if not get_config("chat.capture_enabled"):
+    if not get_config("app.chat_capture_enabled", get_config("chat.capture_enabled", False)):
         return
 
-    capture_file = get_config("chat.capture_file") or str(LOG_DIR / "app_chat_capture.jsonl")
+    capture_file = get_config(
+        "app.chat_capture_file",
+        get_config("chat.capture_file", str(LOG_DIR / "app_chat_capture.jsonl")),
+    ) or str(LOG_DIR / "app_chat_capture.jsonl")
     try:
         event = _build_capture_event(resp, model, phase, seq)
         with open(capture_file, "ab") as f:
