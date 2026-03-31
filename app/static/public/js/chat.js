@@ -1,3 +1,8 @@
+import { buildMediaItems } from '../src/chat/media_items.js';
+import { PretextLayoutEngine } from '../src/chat/pretext_layout.js';
+import { splitStableAndTail, renderLiteMarkdown } from '../src/chat/stream_blocks.js';
+import { StreamRenderer } from '../src/chat/stream_renderer.js';
+
 (() => {
   const modelSelect = document.getElementById('modelSelect');
   const modelPicker = document.getElementById('modelPicker');
@@ -38,13 +43,18 @@
   let followStreamScroll = true;
   let suppressScrollTracking = false;
   let userLockedStreamScroll = false;
+  let pendingBottomScrollRaf = 0;
+  let fixedViewportAnchor = null;
   const activeThinkSpinEntries = new Set();
+  const activeAssistantEntries = new Set();
   let thinkSpinRafId = 0;
   const feedbackUrl = 'https://github.com/chenyme/grok2api/issues/new';
   const STORAGE_KEY = 'grok2api_chat_sessions';
   const SIDEBAR_STATE_KEY = 'grok2api_chat_sidebar_collapsed';
   const MAX_CONTEXT_MESSAGES = 30;
   const AUTO_SCROLL_THRESHOLD = 48;
+  const STREAM_RENDER_INTERVAL_MS = 96;
+  const STREAM_PERSIST_INTERVAL_MS = 320;
   const DEFAULT_SESSION_TITLES = ['新会话', 'New Session'];
   const SEND_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"></path><path d="M22 2L15 22L11 13L2 9L22 2Z"></path></svg>';
   const STOP_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"></rect></svg>';
@@ -133,9 +143,14 @@
       const text = getMessageDisplay(msg);
       const entry = createMessage(msg.role, text);
       if (entry && msg.role === 'assistant') {
+        entry.messageId = msg.id || entry.messageId;
         entry.sources = msg.sources || null;
         entry.rendering = msg.rendering || null;
-        updateMessage(entry, text, true);
+        if (msg.committed === false) {
+          updateMessage(entry, text, false);
+        } else {
+          updateMessage(entry, text, true);
+        }
       } else if (entry && msg.role === 'user') {
         let msgAttachments = [];
         if (Array.isArray(msg.content)) {
@@ -510,6 +525,71 @@
     return hasOwnScroll ? chatLog : body;
   }
 
+  function getScrollViewportTop(container) {
+    if (!container) return 0;
+    if (container === document.body || container === document.documentElement || container === document.scrollingElement) {
+      return 0;
+    }
+    const rect = container.getBoundingClientRect();
+    return rect.top;
+  }
+
+  function captureViewportAnchor(container = getScrollContainer()) {
+    if (!container || !chatLog) return null;
+    const viewportTop = getScrollViewportTop(container);
+    const probeY = Math.max(1, Math.min(window.innerHeight - 1, viewportTop + 12));
+    const probeX = Math.max(16, Math.min(window.innerWidth - 16, Math.floor(window.innerWidth * 0.35)));
+    const candidates = typeof document.elementsFromPoint === 'function'
+      ? document.elementsFromPoint(probeX, probeY)
+      : [];
+    const anchorElement = candidates.find((node) => (
+      node instanceof HTMLElement
+      && chatLog.contains(node)
+      && node.closest('.message-row, .think-block, .think-agent, .think-rollout-group, .stream-lite-paragraph, p, h1, h2, h3, li, .message-image-card')
+    ));
+    const resolvedAnchor = anchorElement
+      ? anchorElement.closest('.think-block, .think-agent, .think-rollout-group, .stream-lite-paragraph, p, h1, h2, h3, li, .message-image-card, .message-row')
+      : null;
+    if (!(resolvedAnchor instanceof HTMLElement)) {
+      return {
+        container,
+        scrollTop: container.scrollTop,
+        anchorElement: null,
+        offsetTop: 0
+      };
+    }
+    return {
+      container,
+      scrollTop: container.scrollTop,
+      anchorElement: resolvedAnchor,
+      offsetTop: resolvedAnchor.getBoundingClientRect().top - viewportTop
+    };
+  }
+
+  function restoreViewportAnchor(snapshot) {
+    if (!snapshot || !snapshot.container) return;
+    const { container, anchorElement, offsetTop, scrollTop } = snapshot;
+    if (!(anchorElement instanceof HTMLElement) || !anchorElement.isConnected) {
+      container.scrollTop = scrollTop;
+      return;
+    }
+    const viewportTop = getScrollViewportTop(container);
+    const currentTop = anchorElement.getBoundingClientRect().top - viewportTop;
+    const delta = currentTop - offsetTop;
+    if (Math.abs(delta) > 0.5) {
+      container.scrollTop += delta;
+    }
+  }
+
+  function refreshFixedViewportAnchor(container = getScrollContainer()) {
+    if (!userLockedStreamScroll || !isSending) {
+      fixedViewportAnchor = null;
+      return null;
+    }
+    fixedViewportAnchor = captureViewportAnchor(container);
+    return fixedViewportAnchor;
+  }
+
   function isNearScrollBottom() {
     const container = getScrollContainer();
     if (!container) return true;
@@ -523,23 +603,36 @@
       return;
     }
     followStreamScroll = isNearScrollBottom();
+    if (followStreamScroll) {
+      fixedViewportAnchor = null;
+    }
   }
 
   function lockStreamScrollFollow() {
     if (!isSending) return;
     userLockedStreamScroll = true;
     followStreamScroll = false;
+    refreshFixedViewportAnchor();
   }
 
   function scrollToBottom(force = false) {
     const container = getScrollContainer();
     if (!container) return;
     if (!force && !followStreamScroll) return;
-    suppressScrollTracking = true;
-    container.scrollTop = container.scrollHeight;
-    requestAnimationFrame(() => {
-      suppressScrollTracking = false;
-      updateFollowStreamScroll();
+    if (pendingBottomScrollRaf) {
+      cancelAnimationFrame(pendingBottomScrollRaf);
+      pendingBottomScrollRaf = 0;
+    }
+    pendingBottomScrollRaf = requestAnimationFrame(() => {
+      pendingBottomScrollRaf = 0;
+      suppressScrollTracking = true;
+      const targetTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      container.scrollTop = targetTop;
+      requestAnimationFrame(() => {
+        suppressScrollTracking = false;
+        fixedViewportAnchor = null;
+        updateFollowStreamScroll();
+      });
     });
   }
 
@@ -717,6 +810,35 @@
     return `\n![${title || 'image'}](${original})\n`;
   }
 
+  function buildRenderedImageSourceMap(rendering) {
+    const cardMap = parseRenderingCards(rendering);
+    const sourceMap = new Map();
+    cardMap.forEach((card) => {
+      if (!card || typeof card !== 'object') return;
+      const image = card.image && typeof card.image === 'object' ? card.image : null;
+      const articleUrl = image ? String(image.link || '').trim() : '';
+      const originalUrl = image ? String(image.original || '').trim() : '';
+      const thumbnailUrl = image ? String(image.thumbnail || '').trim() : '';
+      const resolvedUrl = articleUrl || originalUrl;
+      if (!resolvedUrl) return;
+      const sourceInfo = {
+        href: resolvedUrl,
+        label: getSourceHostname(resolvedUrl),
+        fallbackImage: thumbnailUrl
+      };
+      [
+        originalUrl,
+        normalizeRenderedImageUrl(originalUrl),
+        articleUrl
+      ]
+        .filter(Boolean)
+        .forEach((candidate) => {
+          sourceMap.set(String(candidate), sourceInfo);
+        });
+    });
+    return sourceMap;
+  }
+
   function normalizeRenderedImageUrl(url) {
     const raw = String(url || '').trim();
     if (!raw) return '';
@@ -877,6 +999,13 @@
 
   function normalizeRenderedMarkdownLayout(text) {
     let output = String(text || '');
+    output = output.replace(/<\/?grok:render\b[^>]*>/gi, '');
+    output = output.replace(/<\/?argument\b[^>]*>/gi, '');
+    output = output.replace(/\bcard_id="[^"]*"/gi, '');
+    output = output.replace(/\bcard_type="[^"]*"/gi, '');
+    output = output.replace(/\btype="render_inline_citation"/gi, '');
+    output = output.replace(/\bname="citation_id"/gi, '');
+    output = output.replace(/\bcitation_card['"]?/gi, '');
     output = output.replace(/([^\n])\s*(#{2,6}\s+)/g, '$1\n\n$2');
     output = output.replace(/(<\/span><\/span>)\s*(#{2,6}\s+)/g, '$1\n\n$2');
     output = output.replace(/(<\/span><\/span>)\s*(\d+\.\s+)/g, '$1\n\n$2');
@@ -902,9 +1031,11 @@
     return `${replacement} `;
   }
 
-  function renderExactGrokCards(rawMessage, rendering) {
+  function renderExactGrokCards(rawMessage, rendering, options = {}) {
     const message = String(rawMessage || '');
     if (!rendering || typeof rendering !== 'object') return message;
+    const includeImages = options.includeImages !== false;
+    const preserveImageMarkers = options.preserveImageMarkers === true;
     const cardMap = parseRenderingCards(rendering);
     const extraImages = Array.isArray(rendering.extraImages) ? rendering.extraImages : [];
     
@@ -940,8 +1071,10 @@
           flushCitations();
           const cType = String(card.type || '');
           const cardType = String(card.cardType || '');
-          if (cType === 'render_searched_image' || cType === 'render_edited_image' || cType === 'render_generated_image' || cardType === 'generated_image_card') {
+          if (includeImages && (cType === 'render_searched_image' || cType === 'render_edited_image' || cType === 'render_generated_image' || cardType === 'generated_image_card')) {
             output.push(buildRenderedImageMarkdown(card));
+          } else if (preserveImageMarkers && (cType === 'render_searched_image' || cType === 'render_edited_image' || cType === 'render_generated_image' || cardType === 'generated_image_card')) {
+            output.push(`\n@@GROK_MEDIA_CARD_${id}@@\n`);
           }
         });
 
@@ -950,7 +1083,7 @@
       }
     );
 
-    if (extraImages.length) {
+    if (includeImages && extraImages.length) {
       const appended = extraImages
         .map((url) => String(url || '').trim())
         .filter(Boolean)
@@ -969,7 +1102,13 @@
     return matches.join('\n');
   }
 
-  function getRenderableAssistantText(entry) {
+  function stripThinkMarkup(raw) {
+    const source = String(raw || '');
+    if (!source.includes('<think>')) return source;
+    return source.replace(/<think>[\s\S]*?<\/think>|<think>[\s\S]*$/g, '').trim();
+  }
+
+  function getRenderableAssistantText(entry, options = {}) {
     if (!entry || entry.role !== 'assistant') {
       return entry && entry.raw ? entry.raw : '';
     }
@@ -977,11 +1116,12 @@
     const rawModelResponse = rendering && rendering.rawModelResponse && typeof rendering.rawModelResponse === 'object'
       ? rendering.rawModelResponse
       : null;
-    const rawMessage = rawModelResponse && typeof rawModelResponse.message === 'string'
+    const rawMessageSource = rawModelResponse && typeof rawModelResponse.message === 'string'
       ? rawModelResponse.message
       : (entry.raw || '');
-    const renderedAnswer = renderExactGrokCards(rawMessage, rendering);
-    const thinkMarkup = extractThinkMarkup(entry.raw || '');
+    const thinkMarkup = extractThinkMarkup(rawMessageSource) || extractThinkMarkup(entry.raw || '');
+    const rawMessage = stripThinkMarkup(rawMessageSource);
+    const renderedAnswer = renderExactGrokCards(rawMessage, rendering, options);
     if (!thinkMarkup) return renderedAnswer;
     return `${thinkMarkup}\n\n${renderedAnswer}`.trim();
   }
@@ -1008,7 +1148,7 @@
     });
   }
 
-  function renderBasicMarkdown(rawText) {
+  function renderBasicMarkdown(rawText, imageSourceMap = null) {
     const text = (rawText || '').replace(/\\n/g, '\n');
     const htmlLinks = [];
     const linkExtractedText = text
@@ -1046,18 +1186,46 @@
         .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
         .replace(/\*([^*]+)\*/g, '<em>$1</em>');
 
-      output = output.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, url) => {
-        const safeAlt = escapeHtml(alt || 'image');
-        const safeUrl = escapeHtml(url || '');
-        const caption = safeAlt && safeAlt !== 'image'
-          ? `<figcaption class="message-image-caption">${safeAlt}</figcaption>`
+      output = replaceMarkdownImages(output, ({ alt, middle, url, raw }) => {
+        const normalizedAlt = decodeHtmlEntities(alt || '');
+        const normalizedMiddle = decodeHtmlEntities(middle || '');
+        const normalizedUrl = decodeHtmlEntities(url || '').trim();
+        if (!/^https?:\/\//i.test(normalizedUrl) && !normalizedUrl.startsWith('data:')) {
+          return raw;
+        }
+        const mergedAlt = [String(normalizedAlt || '').trim(), String(normalizedMiddle || '').trim()]
+          .filter(Boolean)
+          .join(' ')
+          .trim();
+        const safeAlt = escapeHtml(mergedAlt || normalizedAlt || 'image');
+        const safeUrl = escapeHtml(normalizedUrl);
+        const sourceInfo = imageSourceMap instanceof Map
+          ? (
+            imageSourceMap.get(normalizedUrl)
+            || imageSourceMap.get(normalizeRenderedImageUrl(normalizedUrl))
+            || null
+          )
+          : null;
+        const sourceHref = escapeHtml(sourceInfo && sourceInfo.href ? sourceInfo.href : normalizedUrl);
+        const fallbackSrc = escapeHtml(sourceInfo && sourceInfo.fallbackImage ? sourceInfo.fallbackImage : '');
+        const sourceLabel = escapeHtml(
+          sourceInfo && sourceInfo.label
+            ? sourceInfo.label
+            : getImageSourceLabel(normalizedUrl)
+        );
+        const caption = mergedAlt && mergedAlt !== 'image'
+          ? `<figcaption class="message-image-caption">${escapeHtml(mergedAlt)}</figcaption>`
           : '';
-        return `<figure class="message-image-card"><img src="${safeUrl}" alt="${safeAlt}" loading="lazy">${caption}</figure>`;
+        const sourceBadge = sourceLabel
+          ? `<a class="message-image-source" href="${sourceHref}" target="_blank" rel="noopener noreferrer" title="${sourceHref}">${sourceLabel}</a>`
+          : '';
+        const fallbackAttr = fallbackSrc ? ` data-fallback-src="${fallbackSrc}"` : '';
+        return `<figure class="message-image-card"><img src="${safeUrl}" alt="${safeAlt}" loading="lazy" referrerpolicy="no-referrer" crossorigin="anonymous"${fallbackAttr}>${sourceBadge}${caption}</figure>`;
       });
 
       output = output.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, url) => {
-        const safeLabel = escapeHtml(label || '');
-        const safeUrl = escapeHtml(url || '');
+        const safeLabel = escapeHtml(decodeHtmlEntities(label || ''));
+        const safeUrl = escapeHtml(decodeHtmlEntities(url || ''));
         return `<a href="${safeUrl}" target="_blank" rel="noopener">${safeLabel}</a>`;
       });
 
@@ -1092,6 +1260,19 @@
     let inTable = false;
     let paragraphLines = [];
 
+    const isStandaloneMediaLine = (line) => {
+      const trimmed = String(line || '').trim();
+      if (!trimmed) return false;
+      if (/^\[[^\]]+\]\((https?:\/\/.+)\)$/.test(trimmed)) {
+        return true;
+      }
+      if (!trimmed.startsWith('![')) {
+        return false;
+      }
+      const replaced = replaceMarkdownImages(trimmed, () => '@@IMG@@');
+      return String(replaced || '').trim() === '@@IMG@@';
+    };
+
     const closeLists = () => {
       if (inUl) {
         htmlParts.push('</ul>');
@@ -1112,20 +1293,35 @@
 
     const flushParagraph = () => {
       if (!paragraphLines.length) return;
-      const joined = paragraphLines.join('<br>');
-      const standaloneMediaLines = paragraphLines.every((line) => {
+      let textChunk = [];
+      let mediaChunk = [];
+
+      const flushTextChunk = () => {
+        if (!textChunk.length) return;
+        htmlParts.push(`<p>${renderInline(textChunk.join('<br>'))}</p>`);
+        textChunk = [];
+      };
+
+      const flushMediaChunk = () => {
+        if (!mediaChunk.length) return;
+        htmlParts.push(mediaChunk.map((line) => renderInline(line.trim())).join(''));
+        mediaChunk = [];
+      };
+
+      paragraphLines.forEach((line) => {
         const trimmed = String(line || '').trim();
-        if (!trimmed) return false;
-        return (
-          /^!\[[^\]]*\]\([^)]+\)$/.test(trimmed) ||
-          /^\[[^\]]+\]\((https?:\/\/[^)]+)\)$/.test(trimmed)
-        );
+        if (!trimmed) return;
+        if (isStandaloneMediaLine(trimmed)) {
+          flushTextChunk();
+          mediaChunk.push(trimmed);
+          return;
+        }
+        flushMediaChunk();
+        textChunk.push(trimmed);
       });
-      if (standaloneMediaLines) {
-        htmlParts.push(paragraphLines.map((line) => renderInline(line.trim())).join(''));
-      } else {
-        htmlParts.push(`<p>${renderInline(joined)}</p>`);
-      }
+
+      flushTextChunk();
+      flushMediaChunk();
       paragraphLines = [];
     };
 
@@ -1344,9 +1540,9 @@
     }));
   }
 
-  function renderFlatBlocks(blocks) {
+  function renderFlatBlocks(blocks, imageSourceMap = null) {
     return (Array.isArray(blocks) ? blocks : []).map((item) => {
-      const body = renderBasicMarkdown((item.lines || []).join('\n').trim());
+      const body = renderBasicMarkdown((item.lines || []).join('\n').trim(), imageSourceMap);
       const typeText = escapeHtml(item.type);
       const typeKey = String(item.type || '').trim().toLowerCase().replace(/\s+/g, '');
       const typeAttr = escapeHtml(typeKey);
@@ -1354,10 +1550,10 @@
     }).join('');
   }
 
-  function renderThinkContent(text, openAll) {
+  function renderThinkContent(text, openAll, imageSourceMap = null) {
     const sections = parseAgentSections(text);
     if (!sections.length) {
-      return renderBasicMarkdown(text);
+      return renderBasicMarkdown(text, imageSourceMap);
     }
     const renderThinkAgentSummary = (title) => {
       const safeTitle = escapeHtml(title);
@@ -1378,7 +1574,7 @@
       }
       return groups.map((group) => {
         const items = group.items.map((item) => {
-          const body = renderBasicMarkdown(item.lines.join('\n').trim());
+          const body = renderBasicMarkdown(item.lines.join('\n').trim(), imageSourceMap);
           const typeText = escapeHtml(item.type);
           const typeKey = String(item.type || '').trim().toLowerCase().replace(/\s+/g, '');
           const typeAttr = escapeHtml(typeKey);
@@ -1396,7 +1592,7 @@
         const synthetic = splitBlocksIntoSyntheticAgents(blocks);
         if (synthetic.length) {
           return synthetic.map((agent, agentIdx) => {
-            const inner = renderFlatBlocks(agent.blocks);
+            const inner = renderFlatBlocks(agent.blocks, imageSourceMap);
             const openAttr = openAll ? ' open' : (idx === 0 && agentIdx === 0 ? ' open' : '');
             return `<details class="think-agent"${openAttr}>${renderThinkAgentSummary(agent.title)}<div class="think-agent-items">${inner}</div></details>`;
           }).join('');
@@ -1404,7 +1600,7 @@
       }
       const inner = blocks.length
         ? renderGroups(blocks, openAll)
-        : `<div class="think-rollout-body">${renderBasicMarkdown(section.lines.join('\n').trim())}</div>`;
+        : `<div class="think-rollout-body">${renderBasicMarkdown(section.lines.join('\n').trim(), imageSourceMap)}</div>`;
       if (!section.title) {
         return `<div class="think-agent-items">${inner}</div>`;
       }
@@ -1414,16 +1610,16 @@
     return `<div class="think-agents">${agentBlocks.join('')}</div>`;
   }
 
-  function renderMarkdown(text) {
+  function renderMarkdown(text, imageSourceMap = null) {
     const raw = text || '';
     const parts = parseThinkSections(raw);
     return parts.map((part) => {
       if (part.type === 'think') {
-        const body = renderThinkContent(part.value.trim(), part.open);
+        const body = renderThinkContent(part.value.trim(), part.open, imageSourceMap);
         const openAttr = part.open ? ' open' : '';
         return `<details class="think-block" data-think="true"${openAttr}><summary class="think-summary">思考</summary><div class="think-content">${body || '<em>（空）</em>'}</div></details>`;
       }
-      return renderBasicMarkdown(part.value);
+      return renderBasicMarkdown(part.value, imageSourceMap);
     }).join('');
   }
 
@@ -1437,7 +1633,22 @@
     bubble.className = 'message-bubble';
     const contentNode = document.createElement('div');
     contentNode.className = 'message-content';
-    contentNode.textContent = content || '';
+    let assistantRoots = null;
+    if (role === 'assistant') {
+      contentNode.classList.add('rendered', 'assistant-rendered');
+      const stableRoot = document.createElement('div');
+      stableRoot.className = 'assistant-stable-root';
+      const liveTailRoot = document.createElement('div');
+      liveTailRoot.className = 'assistant-live-root';
+      const mediaRoot = document.createElement('div');
+      mediaRoot.className = 'assistant-media-root hidden';
+      contentNode.appendChild(stableRoot);
+      contentNode.appendChild(liveTailRoot);
+      contentNode.appendChild(mediaRoot);
+      assistantRoots = { stableRoot, liveTailRoot, mediaRoot };
+    } else {
+      contentNode.textContent = content || '';
+    }
     bubble.appendChild(contentNode);
     row.appendChild(bubble);
 
@@ -1447,6 +1658,7 @@
       row,
       contentNode,
       role,
+      messageId: generateId(),
       raw: content || '',
       sources: null,
       rendering: null,
@@ -1455,9 +1667,241 @@
       firstTokenAt: null,
       hasThink: false,
       thinkElapsed: null,
-      thinkingActive: false
+      thinkingActive: false,
+      streamRenderTimer: 0,
+      streamRenderRaf: 0,
+      streamRenderQueued: false,
+      lastStreamRenderAt: 0,
+      lastPersistAt: 0,
+      assistantRoots,
+      streamRenderer: null
     };
+    if (role === 'assistant') {
+      activeAssistantEntries.add(entry);
+    }
     return entry;
+  }
+
+  function captureOpenState(root, selector) {
+    if (!root || !root.querySelectorAll) return null;
+    const nodes = Array.from(root.querySelectorAll(selector));
+    if (!nodes.length) return null;
+    return nodes.map((node) => node.hasAttribute('open'));
+  }
+
+  function captureScrollState(root, selector) {
+    if (!root || !root.querySelectorAll) return null;
+    const nodes = Array.from(root.querySelectorAll(selector));
+    if (!nodes.length) return null;
+    return nodes.map((node) => node.scrollTop || 0);
+  }
+
+  function restoreOpenState(root, selector, states) {
+    if (!root || !root.querySelectorAll || !Array.isArray(states) || !states.length) return;
+    const nodes = Array.from(root.querySelectorAll(selector));
+    const max = Math.min(nodes.length, states.length);
+    for (let i = 0; i < max; i += 1) {
+      if (states[i]) {
+        nodes[i].setAttribute('open', '');
+      } else {
+        nodes[i].removeAttribute('open');
+      }
+    }
+  }
+
+  function restoreScrollState(root, selector, states) {
+    if (!root || !root.querySelectorAll || !Array.isArray(states) || !states.length) return;
+    const nodes = Array.from(root.querySelectorAll(selector));
+    const max = Math.min(nodes.length, states.length);
+    for (let i = 0; i < max; i += 1) {
+      nodes[i].scrollTop = states[i] || 0;
+    }
+  }
+
+  function ensureAssistantRenderer(entry) {
+    if (!entry || entry.role !== 'assistant' || !entry.assistantRoots) return null;
+    if (entry.streamRenderer) return entry.streamRenderer;
+    const { stableRoot, liveTailRoot, mediaRoot } = entry.assistantRoots;
+    entry.streamRenderer = new StreamRenderer({
+      contentNode: entry.contentNode,
+      stableRoot,
+      liveTailRoot,
+      mediaRoot,
+      renderMarkdown,
+      renderLiteMarkdown,
+      layoutEngine: new PretextLayoutEngine(),
+      getWidth: () => {
+        const width = liveTailRoot.clientWidth || entry.contentNode.clientWidth || 0;
+        return width > 0 ? width : 0;
+      },
+      getFont: () => {
+        const styles = window.getComputedStyle(liveTailRoot);
+        return styles.font || `${styles.fontSize} ${styles.fontFamily}`;
+      },
+      getLineHeight: () => {
+        const styles = window.getComputedStyle(liveTailRoot);
+        const lineHeight = parseFloat(styles.lineHeight);
+        if (Number.isFinite(lineHeight) && lineHeight > 0) return lineHeight;
+        const fontSize = parseFloat(styles.fontSize);
+        return Number.isFinite(fontSize) && fontSize > 0 ? fontSize * 1.6 : 24;
+      }
+    });
+    return entry.streamRenderer;
+  }
+
+  function cancelPendingAssistantRender(entry) {
+    if (!entry) return;
+    if (entry.streamRenderTimer) {
+      clearTimeout(entry.streamRenderTimer);
+      entry.streamRenderTimer = 0;
+    }
+    if (entry.streamRenderRaf) {
+      cancelAnimationFrame(entry.streamRenderRaf);
+      entry.streamRenderRaf = 0;
+    }
+    entry.streamRenderQueued = false;
+  }
+
+  function renderAssistantMessage(entry, finalize = false) {
+    if (!entry || !entry.contentNode) return;
+    const shouldPreserveScroll = isSending && !followStreamScroll;
+    const scrollContainer = shouldPreserveScroll ? getScrollContainer() : null;
+    const viewportAnchor = shouldPreserveScroll
+      ? (fixedViewportAnchor || captureViewportAnchor(scrollContainer))
+      : null;
+    const savedThinkBlockState = captureOpenState(entry.contentNode, '.think-block');
+    const savedThinkAgentState = captureOpenState(entry.contentNode, '.think-agent');
+    const savedRolloutState = captureOpenState(entry.contentNode, '.think-rollout-group');
+    const savedThinkContentScroll = captureScrollState(entry.contentNode, '.think-content');
+    const savedThinkAgentItemsScroll = captureScrollState(entry.contentNode, '.think-agent-items');
+    const savedThinkRolloutBodyScroll = captureScrollState(entry.contentNode, '.think-rollout-body');
+    if (!entry.hasThink && entry.raw.includes('<think>')) {
+      entry.hasThink = true;
+    }
+    const includeInlineImages = finalize;
+    const renderText = getRenderableAssistantText(entry, {
+      includeImages: includeInlineImages,
+      preserveImageMarkers: !includeInlineImages
+    });
+    const imageSourceMap = buildRenderedImageSourceMap(entry.rendering);
+    const mediaItems = buildMediaItems(entry.rendering);
+    const renderer = ensureAssistantRenderer(entry);
+    const renderMeta = finalize
+      ? renderer.finalize({
+        stableText: renderText,
+        liveTailText: '',
+        imageSourceMap,
+        mediaItems
+      })
+      : renderer.pushDelta({
+        ...splitStableAndTail(renderText),
+        imageSourceMap,
+        mediaItems
+      });
+    restoreOpenState(entry.contentNode, '.think-block', savedThinkBlockState);
+    restoreOpenState(entry.contentNode, '.think-agent', savedThinkAgentState);
+    restoreOpenState(entry.contentNode, '.think-rollout-group', savedRolloutState);
+    if (shouldPreserveScroll) {
+      restoreScrollState(entry.contentNode, '.think-content', savedThinkContentScroll);
+      restoreScrollState(entry.contentNode, '.think-agent-items', savedThinkAgentItemsScroll);
+      restoreScrollState(entry.contentNode, '.think-rollout-body', savedThinkRolloutBodyScroll);
+    }
+    if (entry.hasThink) {
+      entry.thinkingActive = !finalize;
+      if (finalize && (entry.thinkElapsed === null || typeof entry.thinkElapsed === 'undefined')) {
+        entry.thinkElapsed = Math.max(1, Math.round((Date.now() - (entry.startedAt || Date.now())) / 1000));
+      }
+      updateThinkSummary(entry, entry.thinkElapsed);
+    }
+    if (entry.assistantRoots) {
+      if (renderMeta.stableChanged || finalize) {
+        liftThinkImages(entry.assistantRoots.stableRoot);
+        applyImageGrid(entry.assistantRoots.stableRoot);
+        syncImageGridLayouts(entry.assistantRoots.stableRoot);
+        syncImageGridControls(entry.assistantRoots.stableRoot);
+        bindInlineCitationExpand(entry.assistantRoots.stableRoot);
+        bindCodeCopyButtons(entry.assistantRoots.stableRoot);
+      }
+      if (renderMeta.mediaChanged || finalize) {
+        syncImageGridLayouts(entry.assistantRoots.mediaRoot);
+        syncImageGridControls(entry.assistantRoots.mediaRoot);
+      }
+    }
+    enhanceBrokenImages(entry.contentNode);
+    bindMessageImagePreview(entry.contentNode);
+    bindInlineCitationExpand(entry.contentNode);
+    const thinkNodes = entry.contentNode.querySelectorAll('.think-content');
+    if (!shouldPreserveScroll) {
+      thinkNodes.forEach((node) => {
+        node.scrollTop = node.scrollHeight;
+      });
+    }
+    if (finalize && entry.row && !entry.row.querySelector('.message-actions')) {
+      attachAssistantActions(entry);
+    }
+    if (scrollContainer) {
+      suppressScrollTracking = true;
+      restoreViewportAnchor(viewportAnchor);
+      requestAnimationFrame(() => {
+        suppressScrollTracking = false;
+        refreshFixedViewportAnchor(scrollContainer);
+      });
+      return;
+    }
+    scrollToBottom();
+  }
+
+  function scheduleAssistantRender(entry) {
+    if (!entry || entry.role !== 'assistant' || !entry.contentNode) return;
+    if (entry.streamRenderQueued) return;
+    const now = Date.now();
+    const wait = Math.max(0, STREAM_RENDER_INTERVAL_MS - (now - (entry.lastStreamRenderAt || 0)));
+    entry.streamRenderQueued = true;
+    const queueRender = () => {
+      entry.streamRenderTimer = 0;
+      entry.streamRenderRaf = requestAnimationFrame(() => {
+        entry.streamRenderRaf = 0;
+        entry.streamRenderQueued = false;
+        entry.lastStreamRenderAt = Date.now();
+        renderAssistantMessage(entry, false);
+      });
+    };
+    if (wait > 0) {
+      entry.streamRenderTimer = setTimeout(queueRender, wait);
+      return;
+    }
+    queueRender();
+  }
+
+  function captureRenderedImageCards(root) {
+    if (!root || !root.querySelectorAll) return new Map();
+    const cardMap = new Map();
+    const cards = root.querySelectorAll('.message-image-card');
+    cards.forEach((card) => {
+      const img = card.querySelector('img');
+      const src = normalizeRenderedImageUrl(img && (img.currentSrc || img.getAttribute('src') || ''));
+      if (!src) return;
+      if (!cardMap.has(src)) {
+        cardMap.set(src, []);
+      }
+      cardMap.get(src).push(card);
+    });
+    return cardMap;
+  }
+
+  function restoreRenderedImageCards(root, cardMap) {
+    if (!root || !root.querySelectorAll || !(cardMap instanceof Map) || !cardMap.size) return;
+    const nextCards = root.querySelectorAll('.message-image-card');
+    nextCards.forEach((card) => {
+      const img = card.querySelector('img');
+      const src = normalizeRenderedImageUrl(img && (img.getAttribute('src') || ''));
+      if (!src || !cardMap.has(src)) return;
+      const queue = cardMap.get(src);
+      if (!Array.isArray(queue) || !queue.length) return;
+      const preserved = queue.shift();
+      if (!preserved || preserved === card) return;
+      card.replaceWith(preserved);
+    });
   }
 
   function renderUserMessage(entry, text, files) {
@@ -1571,6 +2015,12 @@
         }
         const wrapper = document.createElement('div');
         wrapper.className = 'img-grid';
+        if (group.length >= 4) {
+          wrapper.classList.add('img-grid--desktop-scroll');
+        }
+        if (group.length >= 3) {
+          wrapper.classList.add('img-grid--mobile-scroll');
+        }
         const cols = Math.min(4, group.length);
         wrapper.style.setProperty('--cols', String(cols));
         if (groupStart) {
@@ -1609,6 +2059,118 @@
       if (!container || container.closest('.img-grid')) return;
       if (!container.querySelector || !container.querySelector('img')) return;
       wrapImagesInContainer(container);
+    });
+  }
+
+  function updateImageGridLayout(grid) {
+    if (!(grid instanceof HTMLElement)) return;
+    if (window.innerWidth <= 720) {
+      grid.style.removeProperty('grid-template-columns');
+      return;
+    }
+    const figures = Array.from(grid.querySelectorAll(':scope > .message-image-card'));
+    if (figures.length < 2) {
+      grid.style.removeProperty('grid-template-columns');
+      return;
+    }
+    const ratios = figures.map((figure) => {
+      const img = figure.querySelector('img');
+      if (!(img instanceof HTMLImageElement)) return 1;
+      const naturalWidth = Number(img.naturalWidth || 0);
+      const naturalHeight = Number(img.naturalHeight || 0);
+      if (naturalWidth > 0 && naturalHeight > 0) {
+        return Math.max(0.72, Math.min(2.4, naturalWidth / naturalHeight));
+      }
+      return 1;
+    });
+    if (ratios.every((value) => Math.abs(value - 1) < 0.01)) {
+      grid.style.removeProperty('grid-template-columns');
+      return;
+    }
+    const template = ratios.map((value) => `minmax(0, ${value.toFixed(4)}fr)`).join(' ');
+    grid.style.gridTemplateColumns = template;
+  }
+
+  function syncImageGridLayouts(root) {
+    if (!root) return;
+    const grids = root instanceof Element && root.classList.contains('img-grid')
+      ? [root]
+      : Array.from(root.querySelectorAll ? root.querySelectorAll('.img-grid') : []);
+    grids.forEach((grid) => {
+      updateImageGridLayout(grid);
+      const images = Array.from(grid.querySelectorAll(':scope > .message-image-card img'));
+      images.forEach((img) => {
+        if (!(img instanceof HTMLImageElement) || img.dataset.gridBound === '1') return;
+        img.dataset.gridBound = '1';
+        const refresh = () => updateImageGridLayout(grid);
+        img.addEventListener('load', refresh);
+        img.addEventListener('error', refresh);
+      });
+    });
+  }
+
+  function syncImageGridControls(root) {
+    if (!root) return;
+    const grids = root instanceof Element && root.classList.contains('img-grid')
+      ? [root]
+      : Array.from(root.querySelectorAll ? root.querySelectorAll('.img-grid') : []);
+    grids.forEach((grid) => {
+      if (!(grid instanceof HTMLElement)) return;
+      let shell = grid.parentElement;
+      if (!(shell instanceof HTMLElement) || !shell.classList.contains('img-grid-shell')) {
+        shell = document.createElement('div');
+        shell.className = 'img-grid-shell';
+        grid.parentNode && grid.parentNode.insertBefore(shell, grid);
+        shell.appendChild(grid);
+      }
+      let controls = shell.querySelector(':scope > .img-grid-controls');
+      if (!(controls instanceof HTMLElement)) {
+        controls = document.createElement('div');
+        controls.className = 'img-grid-controls';
+        controls.innerHTML = [
+          '<button type="button" class="img-grid-nav img-grid-nav--prev" aria-label="查看上一张"><span class="img-grid-nav__icon" aria-hidden="true"><svg viewBox="0 0 20 20" focusable="false"><path d="M12.5 4.5L7 10l5.5 5.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>',
+          '<button type="button" class="img-grid-nav img-grid-nav--next" aria-label="查看下一张"><span class="img-grid-nav__icon" aria-hidden="true"><svg viewBox="0 0 20 20" focusable="false"><path d="M7.5 4.5L13 10l-5.5 5.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span></button>'
+        ].join('');
+        shell.appendChild(controls);
+      }
+      const prevBtn = controls.querySelector('.img-grid-nav--prev');
+      const nextBtn = controls.querySelector('.img-grid-nav--next');
+      const updateState = () => {
+        const maxScrollLeft = Math.max(0, grid.scrollWidth - grid.clientWidth);
+        const scrollable = maxScrollLeft > 8;
+        controls.hidden = !scrollable;
+        shell.classList.toggle('is-scrollable', scrollable);
+        if (!(prevBtn instanceof HTMLButtonElement) || !(nextBtn instanceof HTMLButtonElement)) return;
+        prevBtn.disabled = !scrollable || grid.scrollLeft <= 8;
+        nextBtn.disabled = !scrollable || grid.scrollLeft >= (maxScrollLeft - 8);
+      };
+      const bindButton = (button, direction) => {
+        if (!(button instanceof HTMLButtonElement) || button.dataset.bound === '1') return;
+        button.dataset.bound = '1';
+        button.addEventListener('click', () => {
+          const items = Array.from(grid.querySelectorAll(':scope > .message-image-card'));
+          if (!items.length) return;
+          const positions = items.map((item) => item.offsetLeft).sort((a, b) => a - b);
+          const current = grid.scrollLeft;
+          const maxScrollLeft = Math.max(0, grid.scrollWidth - grid.clientWidth);
+          let target = current;
+          if (direction > 0) {
+            target = positions.find((value) => value > current + 24) ?? maxScrollLeft;
+          } else {
+            const previous = positions.filter((value) => value < current - 24);
+            target = previous.length ? previous[previous.length - 1] : 0;
+          }
+          target = Math.max(0, Math.min(maxScrollLeft, target));
+          grid.scrollTo({ left: target, behavior: 'smooth' });
+        });
+      };
+      bindButton(prevBtn, -1);
+      bindButton(nextBtn, 1);
+      if (grid.dataset.controlsBound !== '1') {
+        grid.dataset.controlsBound = '1';
+        grid.addEventListener('scroll', updateState, { passive: true });
+      }
+      requestAnimationFrame(updateState);
     });
   }
 
@@ -1692,104 +2254,76 @@
       renderUserMessage(entry, entry.raw, []);
       return;
     }
-    const shouldPreserveScroll = isSending && !followStreamScroll;
-    const scrollContainer = shouldPreserveScroll ? getScrollContainer() : null;
-    const preservedScrollTop = scrollContainer ? scrollContainer.scrollTop : 0;
-    const captureOpenState = (root, selector) => {
-      if (!root || !root.querySelectorAll) return null;
-      const nodes = Array.from(root.querySelectorAll(selector));
-      if (!nodes.length) return null;
-      return nodes.map((node) => node.hasAttribute('open'));
-    };
-    const captureScrollState = (root, selector) => {
-      if (!root || !root.querySelectorAll) return null;
-      const nodes = Array.from(root.querySelectorAll(selector));
-      if (!nodes.length) return null;
-      return nodes.map((node) => node.scrollTop || 0);
-    };
-    const restoreOpenState = (root, selector, states) => {
-      if (!root || !root.querySelectorAll || !Array.isArray(states) || !states.length) return;
-      const nodes = Array.from(root.querySelectorAll(selector));
-      const max = Math.min(nodes.length, states.length);
-      for (let i = 0; i < max; i += 1) {
-        if (states[i]) {
-          nodes[i].setAttribute('open', '');
-        } else {
-          nodes[i].removeAttribute('open');
-        }
-      }
-    };
-    const restoreScrollState = (root, selector, states) => {
-      if (!root || !root.querySelectorAll || !Array.isArray(states) || !states.length) return;
-      const nodes = Array.from(root.querySelectorAll(selector));
-      const max = Math.min(nodes.length, states.length);
-      for (let i = 0; i < max; i += 1) {
-        nodes[i].scrollTop = states[i] || 0;
-      }
-    };
-    const savedThinkBlockState = captureOpenState(entry.contentNode, '.think-block');
-    const savedThinkAgentState = captureOpenState(entry.contentNode, '.think-agent');
-    const savedRolloutState = captureOpenState(entry.contentNode, '.think-rollout-group');
-    const savedThinkContentScroll = captureScrollState(entry.contentNode, '.think-content');
-    const savedThinkAgentItemsScroll = captureScrollState(entry.contentNode, '.think-agent-items');
-    const savedThinkRolloutBodyScroll = captureScrollState(entry.contentNode, '.think-rollout-body');
-    if (!entry.hasThink && entry.raw.includes('<think>')) {
-      entry.hasThink = true;
-    }
-    const renderText = entry.role === 'assistant' ? getRenderableAssistantText(entry) : entry.raw;
     if (finalize) {
-      entry.contentNode.classList.add('rendered');
-      entry.contentNode.innerHTML = renderMarkdown(renderText);
-    } else {
-      if (entry.role === 'assistant') {
-        entry.contentNode.innerHTML = renderMarkdown(renderText);
-      } else {
-        entry.contentNode.textContent = entry.raw;
-      }
-    }
-    restoreOpenState(entry.contentNode, '.think-block', savedThinkBlockState);
-    restoreOpenState(entry.contentNode, '.think-agent', savedThinkAgentState);
-    restoreOpenState(entry.contentNode, '.think-rollout-group', savedRolloutState);
-    if (shouldPreserveScroll) {
-      restoreScrollState(entry.contentNode, '.think-content', savedThinkContentScroll);
-      restoreScrollState(entry.contentNode, '.think-agent-items', savedThinkAgentItemsScroll);
-      restoreScrollState(entry.contentNode, '.think-rollout-body', savedThinkRolloutBodyScroll);
-    }
-    if (entry.hasThink) {
-      entry.thinkingActive = !finalize;
-      if (finalize && (entry.thinkElapsed === null || typeof entry.thinkElapsed === 'undefined')) {
-        entry.thinkElapsed = Math.max(1, Math.round((Date.now() - (entry.startedAt || Date.now())) / 1000));
-      }
-      updateThinkSummary(entry, entry.thinkElapsed);
-    }
-    if (entry.role === 'assistant' || entry.role === 'user') {
-      liftThinkImages(entry.contentNode);
-      applyImageGrid(entry.contentNode);
-      enhanceBrokenImages(entry.contentNode);
-      bindMessageImagePreview(entry.contentNode);
-      bindInlineCitationExpand(entry.contentNode);
-    }
-    if (entry.role === 'assistant') {
-      bindCodeCopyButtons(entry.contentNode);
-      const thinkNodes = entry.contentNode.querySelectorAll('.think-content');
-      if (!shouldPreserveScroll) {
-        thinkNodes.forEach((node) => {
-          node.scrollTop = node.scrollHeight;
-        });
-      }
-      if (finalize && entry.row && !entry.row.querySelector('.message-actions')) {
-        attachAssistantActions(entry);
-      }
-    }
-    if (scrollContainer) {
-      suppressScrollTracking = true;
-      scrollContainer.scrollTop = preservedScrollTop;
-      requestAnimationFrame(() => {
-        suppressScrollTracking = false;
-      });
+      cancelPendingAssistantRender(entry);
+      renderAssistantMessage(entry, true);
       return;
     }
-    scrollToBottom();
+    scheduleAssistantRender(entry);
+  }
+
+  function upsertAssistantMessage(sessionId, messageId, assistantText, assistantSources = null, assistantRendering = null, committed = false, draftState = null) {
+    if (!sessionId || !sessionsData || !messageId) return;
+    const session = sessionsData.sessions.find((s) => s.id === sessionId);
+    if (!session) return;
+    const nextMessage = {
+      id: messageId,
+      role: 'assistant',
+      content: assistantText,
+      sources: assistantSources || null,
+      rendering: assistantRendering || null,
+      committed: Boolean(committed),
+      draftState: committed ? null : (draftState || null)
+    };
+    const existingIndex = session.messages.findIndex((item) => item && item.role === 'assistant' && item.id === messageId);
+    if (existingIndex >= 0) {
+      session.messages[existingIndex] = {
+        ...session.messages[existingIndex],
+        ...nextMessage
+      };
+    } else {
+      session.messages.push(nextMessage);
+    }
+    if (session.messages.length > MAX_CONTEXT_MESSAGES) {
+      session.messages = session.messages.slice(-MAX_CONTEXT_MESSAGES);
+    }
+    session.updatedAt = Date.now();
+    updateSessionTitle(session);
+    if (sessionsData.activeId === sessionId) {
+      messageHistory = session.messages.slice();
+      trimMessageHistory();
+    } else {
+      session.unread = true;
+    }
+    saveSessions();
+    renderSessionList();
+  }
+
+  function persistAssistantDraft(entry, sessionId, force = false) {
+    if (!entry || !sessionId) return;
+    const now = Date.now();
+    if (!force && now - (entry.lastPersistAt || 0) < STREAM_PERSIST_INTERVAL_MS) {
+      return;
+    }
+    entry.lastPersistAt = now;
+    const renderer = ensureAssistantRenderer(entry);
+    const fallbackSplit = splitStableAndTail(getRenderableAssistantText(entry, { includeImages: false }));
+    const draftState = renderer
+      ? renderer.getDraftState()
+      : {
+        stableText: fallbackSplit.stableText,
+        liveTailText: fallbackSplit.liveTailText,
+        mediaItems: buildMediaItems(entry.rendering)
+      };
+    upsertAssistantMessage(
+      sessionId,
+      entry.messageId,
+      entry.raw || '',
+      entry.sources,
+      entry.rendering,
+      force,
+      draftState
+    );
   }
 
   function enhanceBrokenImages(root) {
@@ -1798,26 +2332,102 @@
     images.forEach((img) => {
       if (img.dataset.retryBound) return;
       img.dataset.retryBound = '1';
-      img.addEventListener('error', () => {
-        if (img.dataset.failed) return;
-        img.dataset.failed = '1';
-        const wrapper = document.createElement('button');
-        wrapper.type = 'button';
-        wrapper.className = 'img-retry';
-        wrapper.textContent = '图片加载失败，点击重试';
-        wrapper.addEventListener('click', () => {
-          wrapper.classList.add('loading');
-          const original = img.getAttribute('src') || '';
-          const cacheBust = original.includes('?') ? '&' : '?';
-          img.dataset.failed = '';
-          img.src = `${original}${cacheBust}t=${Date.now()}`;
+      if (!img.dataset.originalSrc) {
+        img.dataset.originalSrc = String(img.getAttribute('src') || '').trim();
+      }
+      const restoreLockedViewport = () => {
+        if (!isSending || followStreamScroll || !userLockedStreamScroll) return;
+        const container = getScrollContainer();
+        if (!container) return;
+        suppressScrollTracking = true;
+        restoreViewportAnchor(fixedViewportAnchor);
+        requestAnimationFrame(() => {
+          suppressScrollTracking = false;
+          refreshFixedViewportAnchor(container);
         });
-        img.replaceWith(wrapper);
+      };
+      const clearPendingRetryTimer = () => {
+        const timerId = Number(img.dataset.retryTimerId || 0);
+        if (timerId) {
+          clearTimeout(timerId);
+          delete img.dataset.retryTimerId;
+        }
+      };
+      const clearFailureUi = (figure) => {
+        if (figure) {
+          figure.classList.remove('is-broken');
+          const retryButton = figure.querySelector('.img-retry');
+          if (retryButton) {
+            retryButton.remove();
+          }
+        }
+        img.classList.remove('hidden');
+        delete img.dataset.failed;
+      };
+      const reloadImage = (forceOriginal = false) => {
+        const original = String(img.dataset.originalSrc || img.getAttribute('src') || '').trim();
+        const candidate = forceOriginal ? original : String(img.getAttribute('src') || original).trim();
+        if (!candidate) return;
+        const cacheBust = candidate.includes('?') ? '&' : '?';
+        img.src = `${candidate}${cacheBust}t=${Date.now()}`;
+      };
+      const showFailureUi = (figure) => {
+        if (!figure) return;
+        figure.classList.add('is-broken');
+        let wrapper = figure.querySelector('.img-retry');
+        if (!(wrapper instanceof HTMLButtonElement)) {
+          wrapper = document.createElement('button');
+          wrapper.type = 'button';
+          wrapper.className = 'img-retry';
+          wrapper.textContent = '图片加载失败，点击重试';
+          wrapper.addEventListener('click', () => {
+            wrapper.classList.add('loading');
+            clearPendingRetryTimer();
+            clearFailureUi(figure);
+            reloadImage(true);
+          });
+          figure.appendChild(wrapper);
+        }
+        img.classList.add('hidden');
+      };
+      img.addEventListener('error', () => {
+        const fallbackSrc = String(img.dataset.fallbackSrc || '').trim();
+        if (fallbackSrc && img.dataset.fallbackTried !== '1') {
+          img.dataset.fallbackTried = '1';
+          img.src = fallbackSrc;
+          restoreLockedViewport();
+          return;
+        }
+        const figure = img.closest('.message-image-card');
+        const retryCount = Number(img.dataset.streamRetryCount || 0);
+        const canSilentRetry = isSending && retryCount < 2;
+        clearPendingRetryTimer();
+        if (canSilentRetry) {
+          img.dataset.streamRetryCount = String(retryCount + 1);
+          const retryDelay = retryCount === 0 ? 180 : 520;
+          const timerId = window.setTimeout(() => {
+            delete img.dataset.retryTimerId;
+            clearFailureUi(figure);
+            reloadImage(true);
+            restoreLockedViewport();
+          }, retryDelay);
+          img.dataset.retryTimerId = String(timerId);
+          restoreLockedViewport();
+          return;
+        }
+        img.dataset.failed = '1';
+        showFailureUi(figure);
+        restoreLockedViewport();
       });
       img.addEventListener('load', () => {
-        if (img.dataset.failed) {
-          img.dataset.failed = '';
+        clearPendingRetryTimer();
+        img.dataset.streamRetryCount = '0';
+        const figure = img.closest('.message-image-card');
+        clearFailureUi(figure);
+        if (img.naturalWidth > 0 && img.naturalHeight > 0 && figure) {
+          figure.style.setProperty('--message-image-ratio', `${img.naturalWidth} / ${img.naturalHeight}`);
         }
+        restoreLockedViewport();
       });
     });
   }
@@ -1878,6 +2488,78 @@
     return String(value || '').replace(/\s+/g, ' ').trim();
   }
 
+  function decodeHtmlEntities(value) {
+    const raw = String(value || '');
+    if (!raw || !/[&][a-zA-Z#0-9]+;/.test(raw)) return raw;
+    const textarea = document.createElement('textarea');
+    textarea.innerHTML = raw;
+    return textarea.value;
+  }
+
+  function replaceMarkdownImages(value, renderImage) {
+    const text = String(value || '');
+    if (!text.includes('![')) return text;
+    let result = '';
+    let index = 0;
+
+    while (index < text.length) {
+      const start = text.indexOf('![', index);
+      if (start === -1) {
+        result += text.slice(index);
+        break;
+      }
+
+      result += text.slice(index, start);
+
+      const altEnd = text.indexOf(']', start + 2);
+      if (altEnd === -1) {
+        result += text.slice(start);
+        break;
+      }
+
+      let cursor = altEnd + 1;
+      while (cursor < text.length && text[cursor] !== '\n' && text[cursor] !== '(') {
+        cursor += 1;
+      }
+      const middle = text.slice(altEnd + 1, cursor);
+
+      if (cursor >= text.length || text[cursor] !== '(') {
+        result += text.slice(start, cursor);
+        index = cursor;
+        continue;
+      }
+
+      let depth = 0;
+      let end = cursor;
+      for (; end < text.length; end += 1) {
+        const ch = text[end];
+        if (ch === '(') {
+          depth += 1;
+        } else if (ch === ')') {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+      }
+
+      if (end >= text.length || text[end] !== ')') {
+        result += text.slice(start);
+        break;
+      }
+
+      const alt = text.slice(start + 2, altEnd);
+      const url = text.slice(cursor + 1, end);
+      result += renderImage({
+        alt,
+        middle,
+        url,
+        raw: text.slice(start, end + 1)
+      });
+      index = end + 1;
+    }
+
+    return result;
+  }
+
   function getSourceHostname(url) {
     try {
       return new URL(url).hostname.replace(/^www\./i, '');
@@ -1889,6 +2571,17 @@
   function getSourceFavicon(hostname) {
     if (!hostname) return '';
     return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=256`;
+  }
+
+  function getImageSourceLabel(url) {
+    const raw = String(url || '').trim();
+    if (!raw || raw.startsWith('data:')) return '';
+    try {
+      const parsed = new URL(raw, window.location.origin);
+      return String(parsed.hostname || '').replace(/^www\./i, '');
+    } catch (e) {
+      return '';
+    }
   }
 
   function bindInlineCitationExpand(root) {
@@ -2656,10 +3349,14 @@
     const historySlice = messageHistory.slice(0, lastUserIndex + 1);
     const retrySessionId = sessionsData ? sessionsData.activeId : null;
     const assistantEntry = createMessage('assistant', '');
+    if (retrySessionId) {
+      persistAssistantDraft(assistantEntry, retrySessionId, true);
+    }
     setSendingState(true);
     setStatus('connecting', '发送中');
     followStreamScroll = true;
     userLockedStreamScroll = false;
+    fixedViewportAnchor = null;
 
     abortController = new AbortController();
     const payload = buildPayloadFrom(historySlice);
@@ -2692,9 +3389,9 @@
         if (!assistantEntry.committed) {
           assistantEntry.committed = true;
           if (retrySessionId) {
-            commitToSession(retrySessionId, assistantEntry.raw || '', assistantEntry.sources, assistantEntry.rendering);
+            commitToSession(retrySessionId, assistantEntry.raw || '', assistantEntry.sources, assistantEntry.rendering, assistantEntry.messageId);
           } else {
-            messageHistory.push({ role: 'assistant', content: assistantEntry.raw || '', sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null });
+            messageHistory.push({ id: assistantEntry.messageId, role: 'assistant', content: assistantEntry.raw || '', sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null, committed: true, draftState: null });
           }
         }
         setStatus('error', '已中止');
@@ -2751,10 +3448,14 @@
 
     const sendSessionId = sessionsData ? sessionsData.activeId : null;
     const assistantEntry = createMessage('assistant', '');
+    if (sendSessionId) {
+      persistAssistantDraft(assistantEntry, sendSessionId, true);
+    }
     setSendingState(true);
     setStatus('connecting', '发送中');
     followStreamScroll = true;
     userLockedStreamScroll = false;
+    fixedViewportAnchor = null;
 
     abortController = new AbortController();
     const payload = buildPayload();
@@ -2792,9 +3493,9 @@
         if (!assistantEntry.committed) {
           assistantEntry.committed = true;
           if (sendSessionId) {
-            commitToSession(sendSessionId, assistantEntry.raw || '', assistantEntry.sources, assistantEntry.rendering);
+            commitToSession(sendSessionId, assistantEntry.raw || '', assistantEntry.sources, assistantEntry.rendering, assistantEntry.messageId);
           } else {
-            messageHistory.push({ role: 'assistant', content: assistantEntry.raw || '', sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null });
+            messageHistory.push({ id: assistantEntry.messageId, role: 'assistant', content: assistantEntry.raw || '', sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null, committed: true, draftState: null });
           }
         }
       } else {
@@ -2809,29 +3510,16 @@
     }
   }
 
-  function commitToSession(sessionId, assistantText, assistantSources = null, assistantRendering = null) {
-    if (!sessionId || !sessionsData) return;
-    const session = sessionsData.sessions.find((s) => s.id === sessionId);
-    if (!session) return;
-    session.messages.push({
-      role: 'assistant',
-      content: assistantText,
-      sources: assistantSources || null,
-      rendering: assistantRendering || null
-    });
-    if (session.messages.length > MAX_CONTEXT_MESSAGES) {
-      session.messages = session.messages.slice(-MAX_CONTEXT_MESSAGES);
-    }
-    session.updatedAt = Date.now();
-    updateSessionTitle(session);
-    if (sessionsData.activeId === sessionId) {
-      messageHistory = session.messages.slice();
-      trimMessageHistory();
-    } else {
-      session.unread = true;
-    }
-    saveSessions();
-    renderSessionList();
+  function commitToSession(sessionId, assistantText, assistantSources = null, assistantRendering = null, messageId = null) {
+    upsertAssistantMessage(
+      sessionId,
+      messageId || generateId(),
+      assistantText,
+      assistantSources,
+      assistantRendering,
+      true,
+      null
+    );
   }
 
   async function handleStream(res, assistantEntry, targetSessionId = null) {
@@ -2862,9 +3550,9 @@
             }
             assistantEntry.committed = true;
             if (targetSessionId) {
-              commitToSession(targetSessionId, assistantText, assistantEntry.sources, assistantEntry.rendering);
+              commitToSession(targetSessionId, assistantText, assistantEntry.sources, assistantEntry.rendering, assistantEntry.messageId);
             } else {
-              messageHistory.push({ role: 'assistant', content: assistantText, sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null });
+              messageHistory.push({ id: assistantEntry.messageId, role: 'assistant', content: assistantText, sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null, committed: true, draftState: null });
             }
             return;
           }
@@ -2881,6 +3569,7 @@
               if (!targetSessionId || (sessionsData && sessionsData.activeId === targetSessionId)) {
                 updateMessage(assistantEntry, assistantText, false);
               }
+              persistAssistantDraft(assistantEntry, targetSessionId, false);
             }
             const delta = json && json.choices && json.choices[0] && json.choices[0].delta
               ? json.choices[0].delta.content
@@ -2899,6 +3588,7 @@
               if (!targetSessionId || (sessionsData && sessionsData.activeId === targetSessionId)) {
                 updateMessage(assistantEntry, assistantText, false);
               }
+              persistAssistantDraft(assistantEntry, targetSessionId, false);
             }
           } catch (e) {
             // ignore parse errors
@@ -2913,9 +3603,9 @@
     }
     assistantEntry.committed = true;
     if (targetSessionId) {
-      commitToSession(targetSessionId, assistantText, assistantEntry.sources, assistantEntry.rendering);
+      commitToSession(targetSessionId, assistantText, assistantEntry.sources, assistantEntry.rendering, assistantEntry.messageId);
     } else {
-      messageHistory.push({ role: 'assistant', content: assistantText, sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null });
+      messageHistory.push({ id: assistantEntry.messageId, role: 'assistant', content: assistantText, sources: assistantEntry.sources || null, rendering: assistantEntry.rendering || null, committed: true, draftState: null });
     }
     } finally {
       activeStreamInfo = null;
@@ -3068,6 +3758,20 @@
         closeAttachmentPreview();
         closeChatImagePreview();
       }
+    });
+    window.addEventListener('resize', () => {
+      document.querySelectorAll('.message-content .img-grid').forEach((grid) => {
+        updateImageGridLayout(grid);
+      });
+      syncImageGridControls(document);
+      activeAssistantEntries.forEach((entry) => {
+        if (!entry || !entry.streamRenderer) return;
+        entry.streamRenderer.resize();
+        if (entry.assistantRoots && entry.assistantRoots.mediaRoot) {
+          syncImageGridLayouts(entry.assistantRoots.mediaRoot);
+          syncImageGridControls(entry.assistantRoots.mediaRoot);
+        }
+      });
     });
 
     const composerInput = document.querySelector('.composer-input');
