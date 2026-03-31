@@ -3,6 +3,8 @@ __pycache__
 *.pyo
 *.pyd
 .Python
+.codex
+nginx
 .tmp-toolify
 node_modules
 package.json
